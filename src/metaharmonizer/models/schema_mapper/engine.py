@@ -81,6 +81,8 @@ class SchemaMapEngine:
         value_dict_path: Optional[Union[str, Path]] = None,
         alias_dict_path: Optional[Union[str, Path]] = None,
         settings: Optional["Settings"] = None,
+        stage2_min_score: Optional[float] = None,
+        stage3_prefer_semantic: bool = False,
     ):
         """
         Initialize the schema mapping engine.
@@ -143,6 +145,30 @@ class SchemaMapEngine:
                 ``Settings.resolve(**overrides)`` rather than ``Settings(...)``
                 so the un-overridden fields still pick up env vars and the
                 project file.
+            stage2_min_score: Minimum stage-2 top-1 score required for value
+                matching to claim a column. Below it, stage 2 returns no match
+                and the column falls through to stage 3. ``None`` (default)
+                preserves the historical behavior, in which ``_run_cascade``
+                returns its best result even when no strategy met its
+                threshold, so *any* value match at all short-circuits the rest
+                of the cascade. ``settings.value_percentage_thresh`` defaults
+                to 0.2, which nearly every stage-2 match already clears, so
+                gating at the configured threshold is close to a no-op — pass
+                an explicit higher value to make the gate bite.
+            stage3_prefer_semantic: When True, stage 3 evaluates the semantic
+                and numeric matchers and prefers SEMANTIC unless numeric clears
+                ``settings.numeric_thresh`` while semantic fails
+                ``settings.field_alias_thresh``. Default ``False`` preserves the
+                historical cascade, in which numeric runs first and early-stops
+                on its own threshold so semantic is never consulted, and in
+                which a below-threshold tie is broken by comparing a numeric
+                score against a cosine similarity — quantities on different
+                scales.
+
+                Both flags exist because the stage a column is routed to, not
+                the quality of any single matcher, is what source values
+                change; see ``docs/values_effect_stage_ablation.md`` in the
+                benchmark-data repo.
         """
         from metaharmonizer.settings import get_settings
         self.settings = settings or get_settings()
@@ -156,6 +182,8 @@ class SchemaMapEngine:
 
         self.top_k = top_k if top_k is not None else self.settings.top_k
         self.mode = mode
+        self.stage2_min_score = stage2_min_score
+        self.stage3_prefer_semantic = stage3_prefer_semantic
 
         # A preset bundles a matched curated + alias + value set; explicit
         # *_dict_path args below override individual entries. ``schema=None``
@@ -443,7 +471,8 @@ class SchemaMapEngine:
         self,
         col: str,
         stage: str,
-        strategies: List[MatchStrategy]
+        strategies: List[MatchStrategy],
+        min_score: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         Run a cascade of matching strategies.
@@ -500,6 +529,17 @@ class SchemaMapEngine:
                     f"(score={top1_score:.3f} < thresh={strategy.threshold}), continuing cascade"
                 )
 
+        # Historically the best below-threshold result is still returned,
+        # which lets a weak match claim the column and short-circuit every
+        # later stage. With min_score the stage declines instead and the
+        # column falls through.
+        if min_score is not None and best_score < min_score:
+            logger.info(
+                f"[{stage}] '{col}' best score {best_score:.3f} < gate "
+                f"{min_score}; declining so later stages can run"
+            )
+            return {}
+
         # Return best result found (even if below threshold)
         if best_result:
             logger.info(
@@ -542,16 +582,54 @@ class SchemaMapEngine:
             MatchStrategy("value", self.value_dict.match, threshold=self.settings.value_percentage_thresh),
             MatchStrategy("ontology", self.ontology.match, threshold=self.settings.value_percentage_thresh),
         ]
-        return self._run_cascade(col, "stage2", strategies)
+        return self._run_cascade(
+            col, "stage2", strategies,
+            min_score=self.stage2_min_score)
 
     def stage3_match(self, col: str) -> Dict[str, Any]:
         """Stage 3: Field matching with combined results."""
+        if self.stage3_prefer_semantic:
+            return self._stage3_prefer_semantic(col)
+
         strategies = [
             MatchStrategy("numeric", self.numeric_combined.match, threshold=self.settings.numeric_thresh),
             MatchStrategy("semantic", self.semantic_combined.match, threshold=self.settings.field_alias_thresh),
         ]
 
         return self._run_cascade(col, "stage3", strategies)
+
+    def _stage3_prefer_semantic(self, col: str) -> Dict[str, Any]:
+        """Stage 3 with the numeric matcher demoted to a fallback.
+
+        Both matchers are evaluated, then one is chosen on its OWN threshold,
+        never by comparing a numeric score with a cosine similarity. The
+        numeric matcher is name-blind, so it is used only where it is
+        confident and the semantic matcher is not.
+        """
+        sem = self.semantic_combined.match(col)
+        num = self.numeric_combined.match(col)
+        sem_top = sem[0][1] if sem else 0.0
+        num_top = num[0][1] if num else 0.0
+
+        sem_ok = bool(sem) and sem_top >= self.settings.field_alias_thresh
+        num_ok = bool(num) and num_top >= self.settings.numeric_thresh
+
+        if num_ok and not sem_ok:
+            pick, name, score = num, "numeric", num_top
+        elif sem:
+            pick, name, score = sem, "semantic", sem_top
+        elif num:
+            pick, name, score = num, "numeric", num_top
+        else:
+            return {}
+
+        logger.info(
+            f"[stage3] '{col}' prefer-semantic picked {name} "
+            f"(sem={sem_top:.3f}/{self.settings.field_alias_thresh}, "
+            f"num={num_top:.3f}/{self.settings.numeric_thresh})"
+        )
+        return self.format_matches_to_row(
+            col=col, stage="stage3", detail=name, matches=pick[:self.top_k])
 
     def stage4_match(self, col: str) -> Dict[str, Any]:
         """Stage 4: LLM matching."""
