@@ -10,7 +10,7 @@ from typing import Dict, Any, List, Optional, Union, TYPE_CHECKING
 if TYPE_CHECKING:
     from metaharmonizer.settings import Settings
 from functools import lru_cache
-from sentence_transformers import SentenceTransformer
+from metaharmonizer.utils.model_loader import load_sentence_transformer_cached
 import torch
 
 from . import config as _config
@@ -249,7 +249,7 @@ class SchemaMapEngine:
         self._load_dictionaries()
 
         # Initialize models
-        self.dict_model = SentenceTransformer(FIELD_MODEL)
+        self.dict_model = load_sentence_transformer_cached(FIELD_MODEL)
 
         # Initialize NCI client
         self.nci_client = NCIClientSync()

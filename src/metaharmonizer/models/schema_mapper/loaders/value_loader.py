@@ -4,7 +4,7 @@ import json
 import torch
 from pathlib import Path
 from typing import Optional, Union, Iterable
-from sentence_transformers import SentenceTransformer
+from metaharmonizer.utils.model_loader import load_sentence_transformer_cached
 from .. import config as _config
 from ..config import NOISE_VALUES, FIELD_MODEL
 from metaharmonizer.custom_logger.custom_logger import CustomLogger
@@ -86,7 +86,7 @@ class ValueLoader:
             logger.warning("[ValueLoader] No valid values found in dictionary")
             return
 
-        model = SentenceTransformer(FIELD_MODEL)
+        model = load_sentence_transformer_cached(FIELD_MODEL)
         with torch.no_grad():
             embs = model.encode(engine.value_texts, convert_to_tensor=True)
             engine.value_embs = torch.nn.functional.normalize(embs, p=2, dim=1)

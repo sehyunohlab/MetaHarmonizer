@@ -26,6 +26,25 @@ def load_method_model_dict(yaml_path: str = DEFAULT_YAML_PATH) -> dict:
         return yaml.safe_load(file)
 
 
+@lru_cache(maxsize=4)
+def load_sentence_transformer_cached(model_name_or_path: str) -> SentenceTransformer:
+    """Load a SentenceTransformer once per repo id / local path and reuse it.
+
+    Unlike :func:`get_embedding_model_cached` this takes the resolved model
+    string (not a method key) and leaves device selection to
+    sentence-transformers, so it is a drop-in for a bare
+    ``SentenceTransformer(name)`` call and keeps MPS/accelerator placement
+    unchanged.
+
+    SchemaMapEngine is constructed once per input table, so an arm that loops
+    over hundreds of studies otherwise loads the same encoder hundreds of
+    times. The MPS caching allocator does not return those weights between
+    instances, which exhausted the 61.2 GiB pool partway through a 373-study
+    arm. Reuse is result-neutral: every call site only calls ``.encode()``.
+    """
+    return SentenceTransformer(model_name_or_path)
+
+
 def get_model(
         method: str,
         yaml_path: str = DEFAULT_YAML_PATH,
