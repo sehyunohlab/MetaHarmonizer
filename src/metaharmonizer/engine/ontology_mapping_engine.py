@@ -1185,11 +1185,19 @@ class OntoMapEngine:
         """
         Applies synonym verification to low-confidence results in Stage 2.
 
+        Gold-free: this method must not read ``curated_ontology``,
+        ``ground_truth_map`` or ``match_level``, because what it returns is a
+        prediction. The merge is accepted on the top-1 score alone. The caller
+        rebuilds ``match_level`` via ``_recompute_match_level`` once the stage
+        has settled. See tests/test_om_stage25_gold_invariance.py for the
+        contract and the history.
+
         Args:
             s2_res (pd.DataFrame): The DataFrame containing Stage 2 results.
 
         Returns:
-            None (modifies s2_res in place)
+            None (modifies s2_res in place; ``match_level`` is left stale for
+            the caller to recompute)
         """
         self._logger.info(
             "Stage 2.5: Synonym Verification for Low Confidence Results")
@@ -1222,7 +1230,6 @@ class OntoMapEngine:
 
             for idx, row in s2_res[low_conf_mask].iterrows():
                 orig_val = row['original_value']
-                curated = row['curated_ontology']
 
                 combined_candidates = {}
                 for i in range(1, self.top_k + 1):
@@ -1268,23 +1275,35 @@ class OntoMapEngine:
                         combined_matches.append(None)
                         combined_scores.append(0.0)
 
-                    match_level = next(
-                        (i + 1 for i, term in enumerate(combined_matches)
-                         if (term or "").strip().lower() == (curated or "").strip().lower()), 99)
-
                     old_top1_score = float(row['match1_score'])
                     new_top1_score = combined_scores[0]
-                    old_match_level = int(row['match_level'])
 
-                    boosted = (new_top1_score > old_top1_score
-                               or match_level < old_match_level)
+                    # Gold-free acceptance: a merge is accepted only when the
+                    # synonym candidates raise the top-1 score.
+                    #
+                    # Until 2026-11-11 this read
+                    #     or match_level < old_match_level
+                    # where ``match_level`` was the rank of
+                    # ``row['curated_ontology']`` -- the answer -- in the merged
+                    # list. That let gold select predictions: identical
+                    # retrieval returned different candidates under different
+                    # answer keys. It was also structurally dead in prod, where
+                    # every ``curated_ontology`` is "Not Found" so both levels
+                    # are the 99 sentinel and ``99 < 99`` is False -- so the
+                    # benchmark measured a cascade that never shipped.
+                    #
+                    # Nothing derived from gold may be read here, ``match_level``
+                    # included. It is rebuilt by ``_recompute_match_level`` once
+                    # the stage has settled, i.e. scored after the fact rather
+                    # than consulted during selection. Guarded by
+                    # tests/test_om_stage25_gold_invariance.py.
+                    boosted = new_top1_score > old_top1_score
 
                     if boosted:
                         self._logger.info(
                             f"Boosted '{orig_val}': "
                             f"S2_top1={row['match1']}({old_top1_score:.3f}) → "
-                            f"Combined_top1={combined_matches[0]}({new_top1_score:.3f}), "
-                            f"match_level: {old_match_level} → {match_level}"
+                            f"Combined_top1={combined_matches[0]}({new_top1_score:.3f})"
                         )
 
                         for i in range(1, self.top_k + 1):
@@ -1295,7 +1314,6 @@ class OntoMapEngine:
                                 idx,
                                 f'match{i}_score'] = f"{combined_scores[i - 1]:.4f}"
 
-                        s2_res.at[idx, 'match_level'] = match_level
                         s2_res.at[idx, 'stage'] = 2.5
                         s2_res.at[idx, 'top1_score_float'] = new_top1_score
                         syn_boosted.append(orig_val)
@@ -1491,6 +1509,9 @@ class OntoMapEngine:
             self._logger.info("Stage 2.5: Disabled (skip_stage25=True)")
         else:
             self._apply_synonym_boost(s2_res)
+            # Predict, then score. _apply_synonym_boost no longer touches gold,
+            # so match_level must be rebuilt from the candidates it settled on.
+            s2_res = self._recompute_match_level(s2_res)
 
         # ========== Stage 3: RAG/RAG_BIE (Optional) ==========
         if self.s3_strategy is None:
