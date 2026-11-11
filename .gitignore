@@ -43,6 +43,7 @@ model_cache/
 # Local-only data: cached corpora, embeddings, pipeline outputs, eval CSVs.
 # Canonical small data ships in metaharmonizer/_bundled_data/; runtime data
 # lives in ~/.metaharmonizer/data/. The repo-root data/ is dev-local only.
+/data/
 schema_mapping_eval/
 # Engine run outputs written back under examples/data/ on first run
 examples/data/outputs/
