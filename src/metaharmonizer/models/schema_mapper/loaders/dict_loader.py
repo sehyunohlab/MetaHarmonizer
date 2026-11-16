@@ -2,7 +2,7 @@
 import pandas as pd
 from pathlib import Path
 from typing import Optional, Union
-from sentence_transformers import SentenceTransformer
+from metaharmonizer.utils.model_loader import load_sentence_transformer_cached
 from metaharmonizer.utils.schema_mapper_utils import normalize
 from .. import config as _config
 from ..config import FIELD_MODEL
@@ -131,7 +131,7 @@ class DictLoader:
             logger.warning("[DictLoader] No fields to encode")
             return None
 
-        model = SentenceTransformer(model_name)
+        model = load_sentence_transformer_cached(model_name)
         embeddings = model.encode(fields, convert_to_tensor=True)
         logger.info(f"[DictLoader] Encoded {len(fields)} fields using {model_name}")
         return embeddings
