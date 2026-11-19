@@ -6,6 +6,7 @@ dependencies like faiss until they are actually needed)
 -------------------
 OntoMapEngine         Ontology mapping (exact/fuzzy → embedding → RAG)
 SchemaMapEngine       Schema mapping (dict/fuzzy → value → type → LLM)
+harmonize             End-to-end: SchemaMapEngine → OntoMapEngine in one call
 
 New-field discovery (FieldSuggester / suggest_from_schema_mapper) is kept in
 the package but intentionally not re-exported here; import it directly from
@@ -26,6 +27,8 @@ __all__ = [
     "__version__",
     "OntoMapEngine",
     "SchemaMapEngine",
+    "harmonize",
+    "HarmonizeResult",
 ]
 
 
@@ -36,4 +39,7 @@ def __getattr__(name: str):
     if name == "SchemaMapEngine":
         from metaharmonizer.models.schema_mapper import SchemaMapEngine
         return SchemaMapEngine
+    if name in ("harmonize", "HarmonizeResult", "FIELD_CATEGORY_PRESETS"):
+        from metaharmonizer import pipeline
+        return getattr(pipeline, name)
     raise AttributeError(f"module 'metaharmonizer' has no attribute {name!r}")

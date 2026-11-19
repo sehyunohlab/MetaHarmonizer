@@ -275,6 +275,44 @@ Richer examples (custom corpus, MONDO/UBERON sources, Stage-4 LLM
 review) are in the reference sections below and the notebooks under
 [`examples/`](examples/).
 
+### End-to-end (SchemaMapper → OntologyMapper)
+
+`harmonize()` runs both modules in one call. It maps every column with
+`SchemaMapEngine`. Columns whose top-1 curated field is ontology-backed
+(e.g. `disease`, `body_site`, `treatment_name` for `cbio`) and that
+score at least `min_schema_score` go on to `OntoMapEngine`. Columns that
+share a corpus are pooled into one `OntoMapEngine` run.
+
+``` python
+from metaharmonizer import harmonize
+
+res = harmonize(
+    "examples/data/cesc_tcga_before_harmonization.csv",
+    schema="cbio",                         # or "gdc"
+    min_schema_score=0.8,                  # SM match1_score gate (0–1)
+    onto_kwargs={"s3_strategy": "rag"},    # forwarded to every OntoMapEngine
+)
+res.schema_map      # SchemaMapEngine output, one row per column
+res.routing         # columns sent to OM, with curated field + corpus
+res.skipped         # ontology-backed columns NOT sent to OM, with reason
+res.ontology_maps   # {(category, ontology_source): OntoMapEngine output}
+res.combined        # one row per (source column, distinct value) + OM matches
+res.errors          # any OM run that failed (others still complete)
+```
+
+The field → `(corpus_category, ontology_source)` map is
+`metaharmonizer.pipeline.FIELD_CATEGORY_PRESETS`. Pass
+`field_categories=` to override it; this is required with a custom
+`target_schema_path`. Noise values (`unknown`, `not reported`, `na`, …)
+are dropped before ontology mapping unless `drop_noise_values=False`.
+Columns that are mostly numeric (`max_numeric_frac`) or look like
+identifiers (`max_unique_ratio`, e.g. patient IDs and UUIDs) are also
+skipped. These guard against Stage-3 SchemaMapper false positives.
+
+`harmonize()` does not rewrite the input table. `OntoMapEngine` always
+returns a best guess, even when nothing in the corpus fits, so check
+`res.combined` (`match1_score`, `stage`) before you substitute values.
+
 ## 5. Datasets
 
 -   For **schema mapping**, provide a biomedical metadata file.
