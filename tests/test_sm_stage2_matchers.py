@@ -123,10 +123,20 @@ class TestValueDictMatcher:
 
 # ── OntologyMatcher helpers ────────────────────────────────────────────────────
 
-def _make_onto_engine(unique_values, hits, frequencies=None, top_k=5):
+# Field names the OntologyMatcher tests use; the matcher drops any field that
+# is not in engine.standard_fields.
+_ONTO_FIELDS = ["sex", "cancer_site", "body_site", "treatment_name", "disease",
+                "cancer_type", "cancer_type_details"]
+
+
+def _make_onto_engine(unique_values, hits, frequencies=None, top_k=5,
+                      standard_fields=None, roots_from_schema=False):
     engine = MagicMock()
     engine.settings = Settings()  # default thresholds (value_unique_cap=50, ...)
     engine.top_k = top_k
+    engine.standard_fields = _ONTO_FIELDS if standard_fields is None else standard_fields
+    engine.ontology_roots_from_schema = roots_from_schema
+    engine.nci_client.root_fields = {"C0": ["placeholder"]}
     engine.unique_values.return_value = unique_values
     n = max(len(unique_values), 1)
     engine.value_frequencies.return_value = (
@@ -204,3 +214,43 @@ class TestOntologyMatcher:
         result = OntologyMatcher(engine).match("cancer")
         fields = [r[0] for r in result]
         assert "cancer_type_details" in fields
+
+    def test_field_not_in_schema_dropped(self):
+        # cMD case: the built-in table says treatment_name, the schema says treatment
+        engine = _make_onto_engine(
+            ["Metformin", "Insulin"],
+            hits={"treatment_name": ["Metformin", "Insulin"]},
+            standard_fields=["treatment", "disease"],
+        )
+        assert OntologyMatcher(engine).match("antibiotics_family") == []
+
+    def test_field_not_in_schema_does_not_take_top_k_slot(self):
+        engine = _make_onto_engine(
+            ["a", "b", "c", "d"],
+            hits={"cancer_type": ["a", "b", "c", "d"], "body_site": ["a", "b"]},
+            standard_fields=["body_site"],
+            top_k=1,
+        )
+        assert [r[0] for r in OntologyMatcher(engine).match("col")] == ["body_site"]
+
+    def test_cancer_type_additions_filtered_to_schema(self):
+        engine = _make_onto_engine(
+            ["Breast Cancer", "Lung Cancer"],
+            hits={"cancer_type": ["Breast Cancer", "Lung Cancer"]},
+            standard_fields=["cancer_type", "disease"],
+        )
+        assert [r[0] for r in OntologyMatcher(engine).match("cancer")] == ["cancer_type", "disease"]
+
+    def test_schema_roots_skip_cancer_type_special_case(self):
+        engine = _make_onto_engine(
+            ["Breast Cancer", "Lung Cancer"],
+            hits={"cancer_type": ["Breast Cancer", "Lung Cancer"]},
+            roots_from_schema=True,
+        )
+        assert [r[0] for r in OntologyMatcher(engine).match("cancer")] == ["cancer_type"]
+
+    def test_no_roots_returns_empty_without_lookup(self):
+        engine = _make_onto_engine(["Male"], hits={"sex": ["Male"]})
+        engine.nci_client.root_fields = {}
+        assert OntologyMatcher(engine).match("sex") == []
+        engine.nci_client.map_value_to_schema.assert_not_called()

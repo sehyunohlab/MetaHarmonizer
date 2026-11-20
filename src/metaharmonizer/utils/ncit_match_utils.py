@@ -25,10 +25,21 @@ NCIT_DESC_PATH = resolve_data_file("corpus/ncit_descendants.json")
 
 class NCIClientSync:
 
-    def __init__(self):
+    def __init__(self, root_fields: Optional[Dict[str, List[str]]] = None):
         """
         Initialize the NCIClientSync.
+
+        Args:
+            root_fields: NCIt root code (e.g. ``"C1909"``) -> target field
+                name(s) that a value under that root identifies. ``None`` uses
+                the built-in ``NCIT_DICT`` (cBioPortal field names). Classifying
+                a code returns the fields of every root it falls under.
         """
+        if root_fields is None:
+            root_fields = {code: [field] for code, field in NCIT_DICT.items()}
+        self.root_fields: Dict[str, List[str]] = {
+            code: list(fields) for code, fields in root_fields.items()
+        }
         # ---- Session with connection pool + retry ----
         self.session = requests.Session()
         retry = Retry(total=5,
@@ -55,11 +66,10 @@ class NCIClientSync:
         # Load descendants sets (include roots themselves for convenience)
         with open(NCIT_DESC_PATH, "r", encoding="utf-8") as f:
             raw = json.load(f)
+        # A root missing from the bundled file is still matched by walking
+        # parents through the API (_classify_via_api).
         self.desc_sets = {
-            "C12219": set(raw.get("C12219", [])) | {"C12219"},
-            "C1909": set(raw.get("C1909", [])) | {"C1909"},
-            "C2991": set(raw.get("C2991", [])) | {"C2991"},
-            "C3262": set(raw.get("C3262", [])) | {"C3262"},
+            code: set(raw.get(code, [])) | {code} for code in self.root_fields
         }
 
         # ---- lightweight adaptive rate limiter (no config needed) ----
@@ -164,15 +174,11 @@ class NCIClientSync:
                 if c.get("code")][:limit]
 
     # ----------------------------- classification ------------------------
-    def _classify_local(self, code: str) -> Optional[str]:
-        if code in self.desc_sets["C12219"]:
-            return NCIT_DICT["C12219"]  # body_site
-        if code in self.desc_sets["C1909"]:
-            return NCIT_DICT["C1909"]  # treatment_name
-        if code in self.desc_sets["C2991"]:
-            return NCIT_DICT["C2991"]  # disease
-        if code in self.desc_sets["C3262"]:
-            return NCIT_DICT["C3262"]  # cancer_type
+    def _classify_local(self, code: str) -> Optional[List[str]]:
+        """Fields of the first root (in table order) whose descendants include code."""
+        for root, fields in self.root_fields.items():
+            if code in self.desc_sets[root]:
+                return fields
         return None
 
     def _fetch_parents(self, code: str) -> Optional[List[str]]:
@@ -195,8 +201,8 @@ class NCIClientSync:
         hits: List[str] = []
 
         # Direct hit
-        if code in NCIT_DICT:
-            return [NCIT_DICT[code]], True
+        if code in self.root_fields:
+            return list(self.root_fields[code]), True
 
         seen = {code}
         frontier = [code]
@@ -214,12 +220,12 @@ class NCIClientSync:
                         continue
                     seen.add(p)
                     # Hit root
-                    if p in NCIT_DICT:
-                        hits.append(NCIT_DICT[p])
+                    if p in self.root_fields:
+                        hits.extend(self.root_fields[p])
                     else:
                         local_cat = self._classify_local(p)
                         if local_cat:
-                            hits.append(local_cat)
+                            hits.extend(local_cat)
                         else:
                             nxt.append(p)
             frontier = nxt
@@ -232,9 +238,11 @@ class NCIClientSync:
             return self.code2category[code]
 
         hits = []
-        for root, catname in NCIT_DICT.items():
+        for root, fields in self.root_fields.items():
             if code in self.desc_sets[root]:
-                hits.append(catname)
+                for f in fields:
+                    if f not in hits:
+                        hits.append(f)
 
         if hits:
             self.code2category[code] = hits
