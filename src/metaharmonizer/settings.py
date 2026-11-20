@@ -78,6 +78,18 @@ def _pick(overrides: dict, file_cfg: dict, name: str,
     return cast(val) if (cast is not None and val is not None) else val
 
 
+def _to_bool(val) -> bool:
+    """Cast a setting to bool; strings like ``"0"``/``"false"``/``"off"`` are False."""
+    if isinstance(val, bool):
+        return val
+    s = str(val).strip().lower()
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"Cannot interpret {val!r} as a boolean setting")
+
+
 @dataclass(frozen=True)
 class Settings:
     """Immutable, resolved configuration snapshot.
@@ -102,6 +114,11 @@ class Settings:
     value_unique_cap: int = 50
     value_percentage_thresh: float = 0.2
     llm_threshold: float = 0.5
+    # SchemaMapper stage-2 NCI EVS ontology matcher. It queries the live NCI
+    # EVS web API with a column's values and its name; False keeps stage 2 to
+    # the local value dictionary, so schema mapping makes no web calls.
+    # Env: SM_NCI_ONTOLOGY (0/1, false/true, off/on).
+    nci_ontology: bool = True
 
     # --- Tier B deployment paths (defaults already env-resolved in _paths) ---
     data_dir: Path = field(default_factory=lambda: _paths.DATA_DIR)
@@ -151,6 +168,7 @@ class Settings:
             value_percentage_thresh=_pick(
                 o, f, "value_percentage_thresh", None, 0.2, float),
             llm_threshold=_pick(o, f, "llm_threshold", None, 0.5, float),
+            nci_ontology=_pick(o, f, "nci_ontology", "SM_NCI_ONTOLOGY", True, _to_bool),
             data_dir=Path(_pick(o, f, "data_dir", "METAHARMONIZER_DATA_DIR",
                                 str(_paths.DATA_DIR))),
             sm_output_dir=Path(_pick(o, f, "sm_output_dir", "SM_OUTPUT_DIR",

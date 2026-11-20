@@ -136,6 +136,7 @@ put them in a config file. Here are the environment variables set in
 | `MODEL_CACHE_ROOT` / `MODEL_CACHE_DIR` | Hugging Face model cache | `~/.metaharmonizer/model_cache` | `MODEL_CACHE_ROOT` takes precedence; `MODEL_CACHE_DIR` is a fallback. |
 | `FIELD_MODEL` | SM embedding stages encoder | `all-MiniLM-L6-v2` | — |
 | `NCIT_POOL_SIZE` | NCI async client connection pool | `8` | Raise for bulk corpus builds. |
+| `SM_NCI_ONTOLOGY` | SM Stage-2 NCI EVS ontology matcher | `1` (on) | `0`/`false`/`off` disables it: SchemaMapper then makes no web calls. Same as `SchemaMapEngine(nci_ontology=False)`. |
 | `LOG_FILE` / `LOG_ENV` | Logger config | `out.log` / `development` | — |
 
 ### Project config file
@@ -332,6 +333,7 @@ engine.run_llm_on_file(
 | `input_path` | str | Path to clinical dataset (TSV or CSV). |
 | `mode` | str | `"auto"` → automatically proceed to Stage 4 if Stage 3 confidence is low. `"manual"` (Default) → output Stage 3 results for review; Stage 4 must be triggered manually. |
 | `top_k` | int | Number of top matches returned for each column. |
+| `nci_ontology` | bool \| None | Stage 2's NCI EVS ontology matcher, which sends each column's unique values and its name to the live NCI EVS API. `False` turns it off: Stage 2 uses the local value dictionary only and schema mapping runs fully locally. `None` (Default) reads `settings.nci_ontology` (env `SM_NCI_ONTOLOGY`, project-file key `nci_ontology`, built-in default `True`). Independent of the value dictionary (`value_dict_path`). |
 | `stage_filter` | list[str] \| None | (`run_llm_on_file`) Only send rows from these stages to the LLM, selected by the `stage` column (e.g. `["stage3"]`). Combined with the confidence filter (`match1_score < llm_threshold`) via AND. `None` (Default) applies no stage restriction. |
 | `merge_results` | bool | (`run_llm_on_file`) If `True`, replace re-matched rows in the input file with their Stage-4 results and write the merged table to `output_csv`; rows not re-matched pass through untouched. If `False` (Default), write only the LLM results. |
 

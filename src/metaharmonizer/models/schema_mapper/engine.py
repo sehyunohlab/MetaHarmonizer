@@ -65,7 +65,7 @@ class SchemaMapEngine:
 
     Stages:
     - Stage 1: Dictionary matching (exact + fuzzy, standard + alias)
-    - Stage 2: Value matching (value dict + ontology)
+    - Stage 2: Value matching (local value dict + optional NCI EVS ontology, ``nci_ontology``)
     - Stage 3: Field matching (numeric + semantic, standard + alias)
     - Stage 4: LLM fallback (auto mode only)
     """
@@ -83,6 +83,7 @@ class SchemaMapEngine:
         settings: Optional["Settings"] = None,
         stage2_min_score: Optional[float] = None,
         stage3_prefer_semantic: bool = False,
+        nci_ontology: Optional[bool] = None,
     ):
         """
         Initialize the schema mapping engine.
@@ -169,6 +170,16 @@ class SchemaMapEngine:
                 the quality of any single matcher, is what source values
                 change; see ``docs/values_effect_stage_ablation.md`` in the
                 benchmark-data repo.
+            nci_ontology: Enable stage 2's NCI EVS ontology matcher, which
+                sends each column's unique values and its name to the live
+                NCI EVS web API. ``False`` disables it: no NCI client is
+                created, stage 2 runs the local value dictionary only, and
+                schema mapping itself makes no web calls (source values never
+                leave the machine). ``None`` (default) uses
+                ``settings.nci_ontology`` (env ``SM_NCI_ONTOLOGY``, project
+                file key ``nci_ontology``; built-in default ``True``, the
+                historical behavior). Independent of ``value_dict_path``:
+                values can be on with the NCI matcher off.
         """
         from metaharmonizer.settings import get_settings
         self.settings = settings or get_settings()
@@ -184,6 +195,8 @@ class SchemaMapEngine:
         self.mode = mode
         self.stage2_min_score = stage2_min_score
         self.stage3_prefer_semantic = stage3_prefer_semantic
+        self.nci_ontology = (self.settings.nci_ontology if nci_ontology is None
+                             else bool(nci_ontology))
 
         # A preset bundles a matched curated + alias + value set; explicit
         # *_dict_path args below override individual entries. ``schema=None``
@@ -251,8 +264,9 @@ class SchemaMapEngine:
         # Initialize models
         self.dict_model = load_sentence_transformer_cached(FIELD_MODEL)
 
-        # Initialize NCI client
-        self.nci_client = NCIClientSync()
+        # Initialize NCI client (only when the NCI EVS ontology matcher is on)
+        self.nci_client = NCIClientSync() if self.nci_ontology else None
+        logger.info(f"[Engine] NCI EVS ontology matcher: {'on' if self.nci_ontology else 'off'}")
 
         # Initialize matchers
         self._init_matchers()
@@ -336,7 +350,7 @@ class SchemaMapEngine:
 
         # Stage 2
         self.value_dict = ValueDictMatcher(self)
-        self.ontology = OntologyMatcher(self)
+        self.ontology = OntologyMatcher(self) if self.nci_ontology else None
 
         # Stage 3
         self.numeric_combined = NumericCombinedMatcher(self)
@@ -580,8 +594,10 @@ class SchemaMapEngine:
 
         strategies = [
             MatchStrategy("value", self.value_dict.match, threshold=self.settings.value_percentage_thresh),
-            MatchStrategy("ontology", self.ontology.match, threshold=self.settings.value_percentage_thresh),
         ]
+        if self.ontology is not None:
+            strategies.append(MatchStrategy(
+                "ontology", self.ontology.match, threshold=self.settings.value_percentage_thresh))
         return self._run_cascade(
             col, "stage2", strategies,
             min_score=self.stage2_min_score)
