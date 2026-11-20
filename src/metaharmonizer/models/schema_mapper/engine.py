@@ -59,6 +59,47 @@ def _sibling_path(schema_path: Union[str, Path], suffix: str) -> Path:
     p = Path(schema_path)
     return p.with_name(p.stem + suffix)
 
+ONTOLOGY_ROOT_COLUMN = "ontology_root"
+
+
+def _parse_ontology_roots(schema_df: pd.DataFrame) -> Optional[Dict[str, List[str]]]:
+    """Read the optional ``ontology_root`` column of a target schema.
+
+    Each cell holds one or more CURIEs separated by ``|``, e.g.
+    ``NCIT:C1909``. A column whose values fall under a root becomes a stage-2
+    candidate for that row's field.
+
+    Returns ``None`` when the column is absent (the caller then uses the
+    built-in NCIt table), otherwise NCIt code -> field names. Only ``NCIT:``
+    roots are supported for now; others are skipped with a warning.
+    """
+    if schema_df is None or ONTOLOGY_ROOT_COLUMN not in schema_df.columns:
+        return None
+    roots: Dict[str, List[str]] = {}
+    skipped = []
+    for field, cell in zip(schema_df["field_name"], schema_df[ONTOLOGY_ROOT_COLUMN]):
+        if pd.isna(field) or pd.isna(cell):
+            continue
+        for curie in str(cell).split("|"):
+            curie = curie.strip()
+            if not curie:
+                continue
+            prefix, sep, local = curie.partition(":")
+            if not sep or prefix.strip().upper() != "NCIT" or not local.strip():
+                skipped.append(f"{field}={curie}")
+                continue
+            fields = roots.setdefault(local.strip(), [])
+            if field not in fields:
+                fields.append(field)
+    if skipped:
+        logger.warning(
+            f"[Engine] {ONTOLOGY_ROOT_COLUMN}: only NCIT: roots are supported; "
+            f"skipped {', '.join(skipped)}"
+        )
+    logger.info(f"[Engine] {ONTOLOGY_ROOT_COLUMN}: {len(roots)} NCIt root(s) from schema")
+    return roots
+
+
 class SchemaMapEngine:
     """
     Main schema mapping engine with multi-stage cascade matching.
@@ -147,15 +188,15 @@ class SchemaMapEngine:
                 so the un-overridden fields still pick up env vars and the
                 project file.
             stage2_min_score: Minimum stage-2 top-1 score required for value
-                matching to claim a column. Below it, stage 2 returns no match
-                and the column falls through to stage 3. ``None`` (default)
-                preserves the historical behavior, in which ``_run_cascade``
-                returns its best result even when no strategy met its
-                threshold, so *any* value match at all short-circuits the rest
-                of the cascade. ``settings.value_percentage_thresh`` defaults
-                to 0.2, which nearly every stage-2 match already clears, so
-                gating at the configured threshold is close to a no-op — pass
-                an explicit higher value to make the gate bite.
+                matching to claim a column. A stage-2 matcher's result is
+                accepted only if its top-1 score is at least
+                ``max(settings.value_percentage_thresh, stage2_min_score)``;
+                otherwise the next stage-2 matcher is tried, and if none
+                qualifies stage 2 returns no match and the column falls
+                through to stage 3. ``None`` (default) keeps the historical
+                behavior: any stage-2 match (both matchers only return
+                matches at or above ``value_percentage_thresh``, default 0.2)
+                claims the column.
             stage3_prefer_semantic: When True, stage 3 evaluates the semantic
                 and numeric matchers and prefers SEMANTIC unless numeric clears
                 ``settings.numeric_thresh`` while semantic fails
@@ -264,8 +305,14 @@ class SchemaMapEngine:
         # Initialize models
         self.dict_model = load_sentence_transformer_cached(FIELD_MODEL)
 
-        # Initialize NCI client (only when the NCI EVS ontology matcher is on)
-        self.nci_client = NCIClientSync() if self.nci_ontology else None
+        # Initialize NCI client (only when the NCI EVS ontology matcher is on).
+        # A schema with an ``ontology_root`` column names the NCIt root(s) for
+        # each field; otherwise the built-in cBioPortal table is used and its
+        # names are filtered to the schema.
+        self.ontology_roots = _parse_ontology_roots(self.target_schema_df)
+        self.ontology_roots_from_schema = self.ontology_roots is not None
+        self.nci_client = (NCIClientSync(root_fields=self.ontology_roots)
+                           if self.nci_ontology else None)
         logger.info(f"[Engine] NCI EVS ontology matcher: {'on' if self.nci_ontology else 'off'}")
 
         # Initialize matchers
@@ -506,7 +553,7 @@ class SchemaMapEngine:
             Formatted result dict with the best match found
         """
         best_result = None
-        best_score = -1.0
+        best_score = -1.0  # highest top-1 score across the strategies tried
 
         for strategy in strategies:
             matches = strategy.match_func(col)
@@ -522,7 +569,7 @@ class SchemaMapEngine:
                 matches=matches[:self.top_k]
             )
 
-            # Get top1 score
+            # Top-1 score of this strategy alone
             top1_score = matches[0][1] if matches else 0.0
 
             # Update best result if this is better
@@ -530,17 +577,21 @@ class SchemaMapEngine:
                 best_result = result
                 best_score = top1_score
 
-            # Early stop if threshold is met
-            if top1_score >= strategy.threshold:
+            # Early stop if threshold is met. With min_score, a result must
+            # also clear the gate here; otherwise any match at or above the
+            # strategy threshold would return before the gate below is
+            # reached.
+            accept = strategy.threshold if min_score is None else max(strategy.threshold, min_score)
+            if top1_score >= accept:
                 logger.info(
                     f"[{stage}] '{col}' matched by {strategy.name} "
-                    f"(score={top1_score:.3f} >= thresh={strategy.threshold}), stopping cascade"
+                    f"(score={top1_score:.3f} >= thresh={accept}), stopping cascade"
                 )
                 return best_result
             else:
                 logger.info(
                     f"[{stage}] '{col}' matched by {strategy.name} "
-                    f"(score={top1_score:.3f} < thresh={strategy.threshold}), continuing cascade"
+                    f"(score={top1_score:.3f} < thresh={accept}), continuing cascade"
                 )
 
         # Historically the best below-threshold result is still returned,

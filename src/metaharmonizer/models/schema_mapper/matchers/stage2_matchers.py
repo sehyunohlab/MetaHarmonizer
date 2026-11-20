@@ -97,6 +97,10 @@ class OntologyMatcher(BaseMatcher):
     """Value-based matching using NCI ontology."""
 
     def match(self, col: str) -> List[Tuple[str, float, str]]:
+        # Schema has an ontology_root column but no NCIt roots: nothing to match.
+        if not self.engine.nci_client.root_fields:
+            return []
+
         unique_values_list = self.engine.unique_values(col)
         ONTOLOGY_COL_NAME_BONUS = 0.3
 
@@ -133,19 +137,27 @@ class OntologyMatcher(BaseMatcher):
                 proportion = min(proportion + ONTOLOGY_COL_NAME_BONUS, 1.0)
             candidates.append((field, proportion, col))
 
-        matches = [m for m in candidates if m[1] > self.engine.settings.value_percentage_thresh]
+        # The built-in table names cBioPortal fields; never propose a field
+        # that is not in the active target schema.
+        allowed = set(self.engine.standard_fields)
+        matches = [m for m in candidates
+                   if m[0] in allowed and m[1] > self.engine.settings.value_percentage_thresh]
         matches.sort(key=lambda x: x[1], reverse=True)
         matches = matches[:self.engine.top_k]
 
-        # Special handling for cancer_type
-        has_cancer = any(m[0] == "cancer_type" for m in matches)
-        has_disease = any(m[0] == "disease" for m in matches)
+        # Special handling for cancer_type (built-in cBioPortal table only; a
+        # schema with ontology_root lists every field under its root itself)
+        if not self.engine.ontology_roots_from_schema:
+            has_cancer = any(m[0] == "cancer_type" for m in matches)
+            has_disease = any(m[0] == "disease" for m in matches)
 
-        if has_cancer and not has_disease and len(matches) < self.engine.top_k:
-            cancer_prop = next(m[1] for m in matches if m[0] == "cancer_type")
-            matches.append(("disease", cancer_prop, col))
-        if has_cancer and len(matches) < self.engine.top_k:
-            cancer_prop = next(m[1] for m in matches if m[0] == "cancer_type")
-            matches.append(("cancer_type_details", cancer_prop, col))
+            if has_cancer and not has_disease and len(matches) < self.engine.top_k:
+                cancer_prop = next(m[1] for m in matches if m[0] == "cancer_type")
+                matches.append(("disease", cancer_prop, col))
+            if has_cancer and len(matches) < self.engine.top_k:
+                cancer_prop = next(m[1] for m in matches if m[0] == "cancer_type")
+                matches.append(("cancer_type_details", cancer_prop, col))
+
+        matches = [m for m in matches if m[0] in allowed]
 
         return matches

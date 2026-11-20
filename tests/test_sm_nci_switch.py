@@ -67,7 +67,10 @@ def light_engine(monkeypatch, tmp_path):
     nci = MagicMock(name="NCIClientSync")
     monkeypatch.setattr(engine_mod, "NCIClientSync", nci)
     monkeypatch.setattr(engine_mod, "load_sentence_transformer_cached", lambda *a, **k: MagicMock())
-    monkeypatch.setattr(SchemaMapEngine, "_load_dictionaries", lambda self: setattr(self, "has_alias_dict", False))
+    def _no_dicts(self):
+        self.has_alias_dict = False
+        self.target_schema_df = None  # no ontology_root column -> built-in table
+    monkeypatch.setattr(SchemaMapEngine, "_load_dictionaries", _no_dicts)
     monkeypatch.setattr(engine_mod, "OUTPUT_DIR", str(tmp_path))
     src = tmp_path / "in.csv"
     src.write_text("sex,age\nmale,40\n")
