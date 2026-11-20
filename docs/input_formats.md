@@ -267,6 +267,8 @@ sex,no,
 -   **Without the column**, the matcher uses a built-in table of cBioPortal
     field names (`body_site`, `treatment_name`, `disease`, `cancer_type`,
     `cancer_type_details`), and drops any name that is not in your schema.
+-   **With `nci_ontology=False`** (or `SM_NCI_ONTOLOGY=0`) the matcher is
+    off, and `ontology_root` has no effect.
 
 `stage2_min_score=` sets how high a Stage 2 score must be to settle a column.
 Below it, the column goes on to Stage 3.
