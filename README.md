@@ -275,6 +275,66 @@ Richer examples (custom corpus, MONDO/UBERON sources, Stage-4 LLM
 review) are in the reference sections below and the notebooks under
 [`examples/`](examples/).
 
+### End-to-end (SchemaMapper → OntologyMapper)
+
+`harmonize()` runs both modules in one call. It maps every column with
+`SchemaMapEngine`. Columns whose top-1 curated field is ontology-backed
+(e.g. `disease`, `body_site`, `treatment_name` for `cbio`) and that
+score at least `min_schema_score` go on to `OntoMapEngine`. Columns that
+share a corpus are pooled into one `OntoMapEngine` run.
+
+``` python
+from metaharmonizer import harmonize
+
+res = harmonize(
+    "examples/data/cesc_tcga_before_harmonization.csv",
+    schema="cbio",                         # or "gdc"
+    min_schema_score=0.8,                  # SM match1_score gate (0–1)
+    onto_kwargs={"s3_strategy": "rag"},    # forwarded to every OntoMapEngine
+    multi_valued_fields={"treatment_name"},  # fields that may hold several terms
+    id_columns=["PATIENT_ID"],             # carried into the per-sample output
+)
+res.schema_map      # SchemaMapEngine output, one row per column
+res.routing         # columns sent to OM, with curated field + corpus
+res.skipped         # ontology-backed columns NOT sent to OM, with reason
+res.ontology_maps   # {(category, ontology_source): OntoMapEngine output}
+res.combined        # one row per (source column, distinct value) + OM matches
+res.harmonized      # one row per (input row, curated field), columns merged
+res.wide()          # one row per input row: <field>, <field>_ontology_term_id
+res.errors          # any OM run that failed (others still complete)
+```
+
+**Several columns, one field.** When more than one source column is sent
+to the same curated field, `res.harmonized` merges them for each row:
+
+-   *Single-valued fields* (the default): the highest-`schema_score`
+    column that has a mapped value for that row wins. Other columns'
+    values go into `dropped` (`col=value→label`), and `conflict` is set
+    when one of them maps to a different term. Because the winner is
+    chosen per row, a lower-scoring column still fills rows where the
+    better one is empty. That happens in pooled tables where each study
+    uses a different column.
+-   *Fields in `multi_valued_fields`*: every column's term is kept,
+    de-duplicated by term ID.
+
+`value` and `term_id` are `;`-joined and paired by position (e.g.
+`Type 2 Diabetes Mellitus;Schizophrenia` ↔ `NCIT:C26747;NCIT:C3362`).
+`source_columns` and `original_value` record where each term came from.
+
+The field → `(corpus_category, ontology_source)` map is
+`metaharmonizer.pipeline.FIELD_CATEGORY_PRESETS`. Pass
+`field_categories=` to override it; this is required with a custom
+`target_schema_path`. Noise values (`unknown`, `not reported`, `na`, …)
+are dropped before ontology mapping unless `drop_noise_values=False`.
+Columns that are mostly numeric (`max_numeric_frac`) or look like
+identifiers (`max_unique_ratio`, e.g. patient IDs and UUIDs) are also
+skipped. These guard against Stage-3 SchemaMapper false positives.
+
+`harmonize()` does not rewrite the input table. `OntoMapEngine` always
+returns a best guess, even when nothing in the corpus fits, so check
+`min_score`, `dropped` and `conflict` in `res.harmonized` (or
+`match1_score` and `stage` in `res.combined`) before you use the values.
+
 ## 5. Datasets
 
 -   For **schema mapping**, provide a biomedical metadata file.
