@@ -249,6 +249,28 @@ engine = SchemaMapEngine(
 )
 ```
 
+**Optional `ontology_root` column.** Stage 2's ontology matcher searches each
+column's values in NCIt. If enough of them fall under a field's NCIt root, it
+proposes that field. Name the root(s) per field as CURIEs, separated by `|`:
+
+``` csv
+field_name,is_numeric_field,ontology_root
+disease,no,NCIT:C2991
+treatment,no,NCIT:C1909
+body_site,no,NCIT:C12219
+sex,no,
+```
+
+-   **Fields with no root** are never proposed by this matcher.
+-   **Only `NCIT:` roots are supported for now.** Other prefixes are skipped
+    with a warning (see issue #104).
+-   **Without the column**, the matcher uses a built-in table of cBioPortal
+    field names (`body_site`, `treatment_name`, `disease`, `cancer_type`,
+    `cancer_type_details`), and drops any name that is not in your schema.
+
+`stage2_min_score=` sets how high a Stage 2 score must be to settle a column.
+Below it, the column goes on to Stage 3.
+
 ### 2.4 Output
 
 `run_schema_mapping()` returns a `DataFrame`, one row per **input
