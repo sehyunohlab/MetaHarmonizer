@@ -291,14 +291,35 @@ res = harmonize(
     schema="cbio",                         # or "gdc"
     min_schema_score=0.8,                  # SM match1_score gate (0–1)
     onto_kwargs={"s3_strategy": "rag"},    # forwarded to every OntoMapEngine
+    multi_valued_fields={"treatment_name"},  # fields that may hold several terms
+    id_columns=["PATIENT_ID"],             # carried into the per-sample output
 )
 res.schema_map      # SchemaMapEngine output, one row per column
 res.routing         # columns sent to OM, with curated field + corpus
 res.skipped         # ontology-backed columns NOT sent to OM, with reason
 res.ontology_maps   # {(category, ontology_source): OntoMapEngine output}
 res.combined        # one row per (source column, distinct value) + OM matches
+res.harmonized      # one row per (input row, curated field), columns merged
+res.wide()          # one row per input row: <field>, <field>_ontology_term_id
 res.errors          # any OM run that failed (others still complete)
 ```
+
+**Several columns, one field.** When more than one source column is sent
+to the same curated field, `res.harmonized` merges them for each row:
+
+-   *Single-valued fields* (the default): the highest-`schema_score`
+    column that has a mapped value for that row wins. Other columns'
+    values go into `dropped` (`col=value→label`), and `conflict` is set
+    when one of them maps to a different term. Because the winner is
+    chosen per row, a lower-scoring column still fills rows where the
+    better one is empty. That happens in pooled tables where each study
+    uses a different column.
+-   *Fields in `multi_valued_fields`*: every column's term is kept,
+    de-duplicated by term ID.
+
+`value` and `term_id` are `;`-joined and paired by position (e.g.
+`Type 2 Diabetes Mellitus;Schizophrenia` ↔ `NCIT:C26747;NCIT:C3362`).
+`source_columns` and `original_value` record where each term came from.
 
 The field → `(corpus_category, ontology_source)` map is
 `metaharmonizer.pipeline.FIELD_CATEGORY_PRESETS`. Pass
@@ -311,7 +332,8 @@ skipped. These guard against Stage-3 SchemaMapper false positives.
 
 `harmonize()` does not rewrite the input table. `OntoMapEngine` always
 returns a best guess, even when nothing in the corpus fits, so check
-`res.combined` (`match1_score`, `stage`) before you substitute values.
+`min_score`, `dropped` and `conflict` in `res.harmonized` (or
+`match1_score` and `stage` in `res.combined`) before you use the values.
 
 ## 5. Datasets
 
