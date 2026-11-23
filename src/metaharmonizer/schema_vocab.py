@@ -289,3 +289,124 @@ def build_field_corpora(vocabs: Mapping[str, FieldVocab],
         else:
             logger.warning("[schema_vocab] %s: vocabulary resolved to no terms", f)
     return out
+
+
+# --- drafting a schema table from a SchemaMapper preset ----------------------
+
+# Starting vocabularies for the bundled SchemaMapper presets: curated field →
+# (corpus_category, ontology_source), a key of OntoMapEngine's
+# ``_CORPUS_REGISTRY``, whose root becomes the field's ``DynamicEnum``. Only
+# :func:`draft_schema_table` reads this; :func:`~metaharmonizer.harmonize`
+# takes every corpus from the schema table it is given.
+PRESET_FIELD_CORPORA: Dict[str, Dict[str, Tuple[str, str]]] = {
+    "cbio": {
+        "disease": ("disease", "ncit"),
+        "cancer_type": ("disease", "ncit"),
+        "cancer_type_details": ("disease", "ncit"),
+        "cancer_subtype": ("disease", "ncit"),
+        "body_site": ("bodysite", "ncit"),
+        "treatment_name": ("treatment", "ncit"),
+    },
+    "gdc": {
+        "primary_diagnosis": ("disease", "ncit"),
+        "disease_type": ("disease", "ncit"),
+        "primary_site": ("bodysite", "ncit"),
+        "tissue_or_organ_of_origin": ("bodysite", "ncit"),
+        "site_of_resection_or_biopsy": ("bodysite", "ncit"),
+        "therapeutic_agents": ("treatment", "ncit"),
+    },
+}
+
+SCHEMA_TABLE_COLUMNS = ["ColName", "ColClass", "MultipleValues", "DynamicEnum",
+                        "DynamicEnumProperty", "AllowedValues"]
+
+
+def draft_schema_table(schema: str, allowed_values: bool = True) -> pd.DataFrame:
+    """A schema table drafted from a bundled SchemaMapper preset, to review.
+
+    One row per field of the preset's target schema, in the layout
+    :func:`read_schema_table` reads:
+
+    - ``ColClass``: ``numeric`` for the preset's numeric fields, else
+      ``character``.
+    - ``DynamicEnum`` / ``DynamicEnumProperty``: for the fields in
+      :data:`PRESET_FIELD_CORPORA`, the root of OntoMapEngine's default
+      corpus for that field (e.g. ``NCIT:C3262`` for ``cancer_type``),
+      ``descendant``.
+    - ``AllowedValues`` (``allowed_values=True``): the preset's value
+      dictionary, ``;``-joined. Fields with a label that contains ``;`` or
+      looks like a pattern are left empty (the cell could not be read back);
+      SchemaMapper still gets those values from the copied value dictionary
+      (see :func:`write_schema_table_draft`).
+    - ``MultipleValues``: empty; fill in ``TRUE`` for fields that hold
+      several values per sample.
+
+    The draft is a starting point. The roots are broad defaults (all of NCIt
+    Neoplasm for every disease field), not a curated choice; narrow or
+    replace them before relying on the result.
+    """
+    import json
+
+    from metaharmonizer.engine.ontology_mapping_engine import _CORPUS_REGISTRY
+    from metaharmonizer.models.schema_mapper.config import resolve_schema_preset
+
+    preset = resolve_schema_preset(schema)
+    ts = pd.read_csv(preset["target_schema_path"], dtype=str, keep_default_na=False)
+    corpora = PRESET_FIELD_CORPORA.get(schema, {})
+    values: Dict[str, list] = {}
+    if allowed_values and Path(preset["value_dict_path"]).exists():
+        with open(preset["value_dict_path"]) as fh:
+            values = json.load(fh)
+
+    rows, unreadable = [], []
+    for f, num in zip(ts["field_name"], ts.get("is_numeric_field", [""] * len(ts))):
+        spec = corpora.get(f)
+        root = _CORPUS_REGISTRY[spec] if spec else ""
+        labels = [str(v).strip() for v in values.get(f, []) if str(v).strip()]
+        if any(";" in v or _REGEX_SIGNS.search(v) for v in labels):
+            unreadable.append(f)
+            labels = []
+        rows.append({
+            "ColName": f,
+            "ColClass": "numeric" if str(num).strip().lower() == "yes" else "character",
+            "MultipleValues": "",
+            "DynamicEnum": root,
+            "DynamicEnumProperty": "descendant" if root else "",
+            "AllowedValues": ";".join(dict.fromkeys(labels)),
+        })
+    if unreadable:
+        logger.warning("[schema_vocab] %s: AllowedValues left empty for %d field(s) whose "
+                       "labels contain ';' or look like patterns: %s",
+                       schema, len(unreadable), unreadable[:5])
+    return pd.DataFrame(rows, columns=SCHEMA_TABLE_COLUMNS)
+
+
+def write_schema_table_draft(schema: str, path: Union[str, Path],
+                             allowed_values: bool = True,
+                             overwrite: bool = False) -> Path:
+    """Write :func:`draft_schema_table` to ``path`` with the preset's dictionaries.
+
+    The preset's SchemaMapper alias and value dictionaries are copied next to
+    it as ``<stem>.alias.csv`` and ``<stem>.values.json``, which
+    :func:`~metaharmonizer.harmonize` picks up, so schema mapping keeps the
+    preset's aliases. Edit the CSV, then pass its path as ``schema_table``.
+    """
+    import shutil
+
+    from metaharmonizer.models.schema_mapper.config import resolve_schema_preset
+
+    path = Path(path)
+    sibs = {".alias.csv": "alias_dict_path", ".values.json": "value_dict_path"}
+    outs = [path] + [path.with_name(path.stem + s) for s in sibs]
+    if not overwrite and any(p.exists() for p in outs):
+        raise FileExistsError(f"{[str(p) for p in outs if p.exists()]} exist; "
+                              f"pass overwrite=True to replace them")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    draft_schema_table(schema, allowed_values).to_csv(path, index=False)
+    preset = resolve_schema_preset(schema)
+    for suffix, key in sibs.items():
+        src = Path(preset[key])
+        if src.exists():
+            shutil.copyfile(src, path.with_name(path.stem + suffix))
+    logger.info("[schema_vocab] wrote %s draft schema table to %s", schema, path)
+    return path

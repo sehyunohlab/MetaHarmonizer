@@ -1,13 +1,22 @@
 """End-to-end harmonization: SchemaMapper → OntologyMapper in one call.
 
-:func:`harmonize` runs :class:`SchemaMapEngine` over every column of a
-clinical table, picks the columns whose top-1 curated field is
-ontology-backed (see :data:`FIELD_CATEGORY_PRESETS`), and runs
-:class:`OntoMapEngine` over those columns' distinct values.
+:func:`harmonize` takes a clinical table and a *schema table* (a data
+dictionary). The schema table is the single source of what the output should
+look like:
 
-Columns that map to the same ``(corpus_category, ontology_source)`` are pooled
-into a **single** OntoMapEngine run, so each corpus/model set is loaded once
-rather than once per column.
+- its fields are the SchemaMapper target schema, and
+- each field's ``DynamicEnum`` roots and ``AllowedValues`` labels are that
+  field's OntologyMapper corpora (see :mod:`metaharmonizer.schema_vocab`).
+
+:func:`harmonize` runs :class:`SchemaMapEngine` over every column, picks the
+columns whose top-1 curated field has a vocabulary, and runs
+:class:`OntoMapEngine` over those columns' distinct values against that
+field's corpora. A field with no vocabulary in the schema table is never sent
+to OntologyMapper; its values are passed through as-is.
+
+Columns whose fields share a corpus are pooled into a **single**
+OntoMapEngine run, so each corpus/model set is loaded once rather than once
+per column.
 
 The pipeline deliberately does **not** rewrite the input table. OntoMapEngine
 always returns a best guess (it never abstains), so blindly substituting its
@@ -19,7 +28,7 @@ Example::
 
     from metaharmonizer import harmonize
 
-    res = harmonize("clinical.tsv", schema="cbio")
+    res = harmonize("sampleMetadata.csv", "cMD_data_dictionary.csv")
     res.schema_map        # SchemaMapEngine output (one row per column)
     res.ontology_maps     # {(category, source): OntoMapEngine output}
     res.combined          # long table: column × value × ontology match
@@ -28,20 +37,19 @@ Example::
                           # unmapped fields passed through; provenance=True adds
                           # <field>_source_column / _schema_score / _map_score …
 
-With a schema table (``schema_table=``, e.g. a data dictionary with
-``DynamicEnum`` / ``AllowedValues`` columns) the table is the single source:
-it is the SchemaMapper target schema, and each field's vocabulary becomes its
-OntologyMapper corpus (see :mod:`metaharmonizer.schema_vocab`), so no
-``field_categories`` is needed::
+To start from a bundled SchemaMapper preset instead of your own data
+dictionary, draft a schema table, review its ``DynamicEnum`` and
+``AllowedValues`` columns, and pass it in::
 
-    res = harmonize("sampleMetadata.csv", schema=None,
-                    schema_table="cMD_data_dictionary.csv")
+    from metaharmonizer.schema_vocab import write_schema_table_draft
+
+    write_schema_table_draft("cbio", "cbio_schema.csv")   # then edit it
+    res = harmonize("clinical.tsv", "cbio_schema.csv")
 """
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
@@ -54,29 +62,14 @@ CategorySpec = Tuple[str, str]  # (corpus_category, ontology_source)
 # an ontology plus a local list); each value then keeps its best-scoring match.
 FieldSpec = Union[CategorySpec, Sequence[CategorySpec]]
 
-# Curated field → (corpus_category, ontology_source), per SchemaMapEngine
-# preset. Only free-text, ontology-backed fields are listed; categorical
-# fields with a closed value set (e.g. GDC ``treatment_type``, cBio
-# ``sample_type``) are handled by SchemaMapper's value dict, not here.
-# Every pair must be a key of OntoMapEngine's ``_CORPUS_REGISTRY``.
-FIELD_CATEGORY_PRESETS: Dict[str, Dict[str, CategorySpec]] = {
-    "cbio": {
-        "disease": ("disease", "ncit"),
-        "cancer_type": ("disease", "ncit"),
-        "cancer_type_details": ("disease", "ncit"),
-        "cancer_subtype": ("disease", "ncit"),
-        "body_site": ("bodysite", "ncit"),
-        "treatment_name": ("treatment", "ncit"),
-    },
-    "gdc": {
-        "primary_diagnosis": ("disease", "ncit"),
-        "disease_type": ("disease", "ncit"),
-        "primary_site": ("bodysite", "ncit"),
-        "tissue_or_organ_of_origin": ("bodysite", "ncit"),
-        "site_of_resection_or_biopsy": ("bodysite", "ncit"),
-        "therapeutic_agents": ("treatment", "ncit"),
-    },
-}
+# Positional index of the input row in every per-row output. Named so it
+# cannot collide with an input column carried through ``id_columns``.
+ROW_ID = "metaharmonizer_row_id"
+
+# Columns of HarmonizeResult.harmonized besides ROW_ID and id_columns.
+_HARMONIZED_COLS = ["curated_field", "corpus_category", "ontology_source",
+                    "value", "term_id", "original_value", "source_columns",
+                    "min_score", "dropped", "conflict"]
 
 _EMPTY_STRINGS = {"", "nan", "none"}
 
@@ -97,7 +90,7 @@ class HarmonizeResult:
             OntologyMapper, with the ``reason`` (low schema score, numeric
             values, identifier-like values, or no values left after cleaning).
         passthrough_routing: Columns whose SchemaMapper top-1 is a field with
-            no vocabulary (not in ``field_categories``), scoring at least
+            no vocabulary in the schema table, scoring at least
             ``min_schema_score``. :meth:`wide` copies their values as-is.
         errors: ``(category, source)`` → error message for any OntoMapEngine
             run that failed (the rest of the pipeline still completes).
@@ -106,10 +99,13 @@ class HarmonizeResult:
             to the same field are merged here (see :func:`harmonize`,
             ``multi_valued_fields``). Columns:
 
-            - ``row``: positional index of the input row, then any ``id_columns``
+            - ``metaharmonizer_row_id`` (:data:`ROW_ID`): positional index of
+              the input row, then any ``id_columns``
             - ``curated_field``, ``corpus_category``, ``ontology_source``
             - ``value`` / ``term_id``: ``;``-joined labels and CURIEs, paired by
-              position (``term_id`` is empty where the corpus had no code)
+              position. ``term_id`` is the corpus term's CURIE as the schema
+              vocabulary gave it (``obo_id``), and empty for allowed-value
+              labels that have no ontology code
             - ``original_value`` / ``source_columns``: the kept source values
               and the columns they came from, paired by position
             - ``min_score``: lowest OntoMapEngine ``match1_score`` among kept
@@ -136,8 +132,8 @@ class HarmonizeResult:
              provenance: bool = False) -> pd.DataFrame:
         """One row per input row, in the layout of a curated release.
 
-        Columns: ``row``, any ``id_columns``, then per curated field, in schema
-        order (``schema_table`` field order when given):
+        Columns: ``metaharmonizer_row_id``, any ``id_columns``, then per
+        curated field, in ``schema_table`` field order:
 
         - ``<field>``: ``;``-joined labels for ontology-mapped fields; for a
           field without a vocabulary (``passthrough``), the source value as-is
@@ -159,7 +155,7 @@ class HarmonizeResult:
         Rows with nothing for a field hold NaN there.
         """
         out = self.samples.copy()
-        rows = out["row"]
+        rows = out[ROW_ID]
         blocks: Dict[str, Dict[str, pd.Series]] = {}
 
         h = self.harmonized
@@ -169,7 +165,7 @@ class HarmonizeResult:
                 for r in self.routing.drop_duplicates(["curated_field", "source_column"]).itertuples():
                     col_score[(r.curated_field, r.source_column)] = r.schema_score
             for f in h["curated_field"].drop_duplicates():
-                g = h[h["curated_field"] == f].set_index("row")
+                g = h[h["curated_field"] == f].set_index(ROW_ID)
                 b = {f: rows.map(g["value"])}
                 has_ids = g["term_id"].astype(str).str.replace(";", "", regex=False).str.strip().ne("").any()
                 if include_term_ids and has_ids:
@@ -241,40 +237,20 @@ def _noise_values() -> set:
 
 # --- helpers ---------------------------------------------------------------
 
-def _to_curie(code: str, ontology_source: str) -> str:
-    """Invert OntoMapEngine's ``clean_code`` normalization.
+def _label_to_term_id(vc) -> Dict[str, str]:
+    """Lower-cased label → CURIE, read verbatim from a schema corpus.
 
-    ``C1909`` (NCIt, prefix stripped) → ``NCIT:C1909``; ``UBERON_0001988`` →
-    ``UBERON:0001988``; anything else is returned unchanged.
+    The CURIE is the corpus's own ``obo_id`` (e.g. ``NCIT:C2965``), not a
+    reconstruction from OntoMapEngine's normalized ``clean_code``. Labels
+    shared by several codes keep the first. A local corpus (allowed-value
+    labels without an ontology code) yields ``{}``, so its term IDs are empty.
     """
-    code = str(code).strip()
-    if not code or code.lower() == "nan":
-        return ""
-    m = re.match(r"^([A-Za-z][A-Za-z0-9]*)_(.+)$", code)
-    if m:
-        return f"{m.group(1).upper()}:{m.group(2)}"
-    if ":" in code:
-        return code
-    if ontology_source.lower() == "ncit":
-        return f"NCIT:{code}"
-    return code
-
-
-def _label_to_term_id(om, ontology_source: str) -> Dict[str, str]:
-    """Lower-cased corpus label → CURIE, from the engine's normalized corpus.
-
-    Labels shared by several codes keep the first code. Returns ``{}`` when
-    the engine exposes no corpus (e.g. a test double).
-    """
-    params = getattr(om, "other_params", None)
-    corpus = params.get("corpus_df") if isinstance(params, dict) else None
-    if corpus is None or "official_label" not in getattr(corpus, "columns", ()):
+    if vc.local:
         return {}
-    if "clean_code" not in corpus.columns:
-        return {}
+    df = vc.corpus_df
     out: Dict[str, str] = {}
-    for lab, code in zip(corpus["official_label"].astype(str), corpus["clean_code"]):
-        out.setdefault(lab.strip().lower(), _to_curie(code, ontology_source))
+    for lab, code in zip(df["label"].astype(str), df["obo_id"].astype(str)):
+        out.setdefault(lab.strip().lower(), code.strip())
     return out
 
 
@@ -292,9 +268,7 @@ def _build_harmonized(
     columns with a value are recorded in ``dropped``. Multi-valued fields
     keep every column's value, de-duplicated by term.
     """
-    cols_out = ["row", "curated_field", "corpus_category", "ontology_source",
-                "value", "term_id", "original_value", "source_columns",
-                "min_score", "dropped", "conflict"]
+    cols_out = [ROW_ID] + _HARMONIZED_COLS
     if combined.empty:
         return pd.DataFrame(columns=cols_out)
     multi = set(multi_valued_fields)
@@ -345,7 +319,7 @@ def _build_harmonized(
             conflict = any((d[3] or d[2].lower()) not in seen for d in dropped)
             scores = [float(e[4]) for e in uniq if e[4] is not None and not pd.isna(e[4])]
             rows.append({
-                "row": i, "curated_field": fld,
+                ROW_ID: i, "curated_field": fld,
                 "corpus_category": ";".join(dict.fromkeys(str(e[5]) for e in uniq)),
                 "ontology_source": ";".join(dict.fromkeys(str(e[6]) for e in uniq)),
                 "value": ";".join(e[2] for e in uniq),
@@ -491,12 +465,28 @@ def _route(
 
 # --- public API ------------------------------------------------------------
 
+def _sibling_dicts(schema_table, schema_kwargs: Dict[str, Any]) -> None:
+    """Pass ``<stem>.alias.csv`` / ``<stem>.values.json`` next to a schema
+    table file to SchemaMapEngine, unless ``schema_kwargs`` already sets them.
+
+    harmonize() hands SchemaMapEngine a derived target-schema file in the
+    cache, so the engine's own sibling-by-name lookup would not find these.
+    """
+    if not isinstance(schema_table, (str, Path)):
+        return
+    p = Path(schema_table)
+    for suffix, key in ((".alias.csv", "alias_dict_path"),
+                        (".values.json", "value_dict_path")):
+        sib = p.with_name(p.stem + suffix)
+        if key not in schema_kwargs and sib.exists():
+            schema_kwargs[key] = str(sib)
+            logger.info("[harmonize] using %s next to the schema table", sib.name)
+
+
 def harmonize(
     input_path: str,
-    schema: Optional[str] = "cbio",
-    *,
-    field_categories: Optional[Mapping[str, FieldSpec]] = None,
     schema_table: Optional[Union[str, Path, pd.DataFrame]] = None,
+    *,
     vocab_cache_dir: Optional[Union[str, Path]] = None,
     min_schema_score: float = 0.8,
     max_numeric_frac: float = 0.5,
@@ -512,24 +502,18 @@ def harmonize(
 
     Args:
         input_path: Clinical CSV/TSV (as for :class:`SchemaMapEngine`).
-        schema: SchemaMapEngine preset (``"cbio"`` or ``"gdc"``). Also selects
-            the default ``field_categories``. Defaults to ``"cbio"``.
-        field_categories: Curated field → ``(corpus_category, ontology_source)``,
-            or a list of such pairs to search several corpora (each value
-            keeps its best-scoring match). Defaults to
-            ``FIELD_CATEGORY_PRESETS[schema]``, or to the corpora derived from
-            ``schema_table``. Required when neither applies (e.g. a custom
-            ``target_schema_path`` in ``schema_kwargs``).
-        schema_table: A schema table (path or DataFrame), e.g. a data
-            dictionary with ``ColName``, ``ColClass``, ``MultipleValues``,
-            ``DynamicEnum``, ``DynamicEnumProperty`` and ``AllowedValues``
-            columns. Used as the SchemaMapper target schema (unless
-            ``schema_kwargs`` sets ``target_schema_path``; NCIt roots become
-            its ``ontology_root``), and each field's ``DynamicEnum`` roots and
-            ``AllowedValues`` labels become its OntologyMapper corpora (see
-            :mod:`metaharmonizer.schema_vocab`). Fields with neither are not
-            sent to OntologyMapper. Allowed-value labels outside any ontology
-            get an empty ``term_id``.
+        schema_table: The target schema as a data dictionary (path or
+            DataFrame) with ``ColName`` and, optionally, ``ColClass``,
+            ``MultipleValues``, ``DynamicEnum``, ``DynamicEnumProperty`` and
+            ``AllowedValues`` columns (see :mod:`metaharmonizer.schema_vocab`).
+            Required. Its fields are the SchemaMapper target schema (unless
+            ``schema_kwargs`` sets ``target_schema_path``), and each field's
+            ``DynamicEnum`` roots and ``AllowedValues`` labels are its
+            OntologyMapper corpora. Fields with neither are not sent to
+            OntologyMapper. When it is a file, ``<stem>.alias.csv`` and
+            ``<stem>.values.json`` beside it are used as SchemaMapper's alias
+            and value dictionaries. To start from a bundled preset, see
+            :func:`metaharmonizer.schema_vocab.write_schema_table_draft`.
         vocab_cache_dir: Where corpora built from ``schema_table`` roots are
             cached. Defaults to ``<data dir>/corpus/schema_vocab``.
         min_schema_score: Minimum SchemaMapper ``match1_score`` (0–1) for a
@@ -548,73 +532,88 @@ def harmonize(
             (e.g. ``mode="auto"``, ``target_schema_path``, ``settings``).
         onto_kwargs: Extra keyword args for every :class:`OntoMapEngine` run
             (e.g. ``s3_strategy="rag"``, ``top_k``, ``output_dir``).
+            ``corpus_df`` and ``ontology_source`` come from the schema table
+            and cannot be set here.
         multi_valued_fields: Curated fields that may hold several values per
-            row (e.g. ``{"disease", "treatment"}``). When several source columns
-            are routed to one of these, :attr:`HarmonizeResult.harmonized`
-            keeps the union of their terms. Every other field is treated as
-            single-valued: per row, the highest-scoring column that has a
-            mapped value wins, and the rest are recorded in ``dropped``.
-            Defaults to the ``MultipleValues`` column of ``schema_table``,
-            else none (all single-valued).
+            row. When several source columns are routed to one of these,
+            :attr:`HarmonizeResult.harmonized` keeps the union of their terms.
+            Every other field is single-valued: per row, the highest-scoring
+            column that has a mapped value wins, and the rest are recorded in
+            ``dropped``. Defaults to the ``MultipleValues`` column of
+            ``schema_table``.
         id_columns: Input columns to carry into :attr:`HarmonizeResult.harmonized`
             and :meth:`HarmonizeResult.wide` (e.g. ``["study_name", "sample_id"]``).
+            They must not share a name with a generated output column
+            (``metaharmonizer_row_id``, ``value``, ``term_id``…) or with a
+            schema field that has a vocabulary.
         raise_on_error: Re-raise an OntoMapEngine failure instead of recording
             it in :attr:`HarmonizeResult.errors`. Defaults to ``False``.
 
     Returns:
         HarmonizeResult
     """
+    from metaharmonizer import schema_vocab as sv
+
+    if schema_table is None or (isinstance(schema_table, str)
+                                and not Path(schema_table).exists()
+                                and schema_table in sv.PRESET_FIELD_CORPORA):
+        hint = schema_table or "cbio"
+        raise ValueError(
+            "harmonize() needs a schema_table: a data dictionary whose DynamicEnum "
+            "and AllowedValues columns define each field's vocabulary. To start "
+            f"from the bundled {hint!r} preset, draft one, review it, and pass its "
+            "path: metaharmonizer.schema_vocab.write_schema_table_draft("
+            f"{hint!r}, '{hint}_schema.csv').")
     schema_kwargs = dict(schema_kwargs or {})
     onto_kwargs = dict(onto_kwargs or {})
-    corpora: Dict[str, Any] = {}   # corpus_category -> VocabCorpus
-    field_order: List[str] = []
+    clash = {"corpus_df", "ontology_source"} & set(onto_kwargs)
+    if clash:
+        raise ValueError(f"onto_kwargs cannot set {sorted(clash)}: each field's corpus "
+                         f"and its ontology come from schema_table")
 
-    if schema_table is not None:
-        from metaharmonizer import schema_vocab as sv
-        from metaharmonizer._paths import CORPUS_DIR
-        cache = Path(vocab_cache_dir) if vocab_cache_dir else CORPUS_DIR / "schema_vocab"
-        table = sv.load_schema_table(schema_table)
-        vocabs = sv.read_schema_table(table)
-        field_order = list(vocabs)
-        if "target_schema_path" not in schema_kwargs:
-            ts = sv.target_schema_frame(table)
-            cache.mkdir(parents=True, exist_ok=True)
-            import hashlib
-            digest = hashlib.sha1(ts.to_csv(index=False).encode()).hexdigest()[:10]
-            ts_path = cache / f"target_schema_{digest}.csv"
-            ts.to_csv(ts_path, index=False)
-            schema_kwargs["target_schema_path"] = str(ts_path)
-        if field_categories is None:
-            fc = sv.build_field_corpora(vocabs, cache)
-            field_categories = {f: [(c.key, c.ontology_source) for c in cs]
-                                for f, cs in fc.items()}
-            corpora = {c.key: c for cs in fc.values() for c in cs}
-            logger.info("[harmonize] %d fields with a vocabulary, %d corpora",
-                        len(field_categories), len(corpora))
-        if multi_valued_fields is None:
-            multi_valued_fields = [f for f, v in vocabs.items() if v.multiple_values]
-    multi_valued_fields = list(multi_valued_fields or ())
+    from metaharmonizer._paths import CORPUS_DIR
+    cache = Path(vocab_cache_dir) if vocab_cache_dir else CORPUS_DIR / "schema_vocab"
+    table = sv.load_schema_table(schema_table)
+    vocabs = sv.read_schema_table(table)
+    field_order = list(vocabs)
+    if "target_schema_path" not in schema_kwargs:
+        ts = sv.target_schema_frame(table)
+        cache.mkdir(parents=True, exist_ok=True)
+        import hashlib
+        digest = hashlib.sha1(ts.to_csv(index=False).encode()).hexdigest()[:10]
+        ts_path = cache / f"target_schema_{digest}.csv"
+        ts.to_csv(ts_path, index=False)
+        schema_kwargs["target_schema_path"] = str(ts_path)
+    _sibling_dicts(schema_table, schema_kwargs)
+    if multi_valued_fields is None:
+        multi_valued_fields = [f for f, v in vocabs.items() if v.multiple_values]
+    multi_valued_fields = list(multi_valued_fields)
 
-    if field_categories is None:
-        if "target_schema_path" in schema_kwargs:
-            raise ValueError(
-                "field_categories is required with a custom target_schema_path.")
-        if schema not in FIELD_CATEGORY_PRESETS:
-            raise ValueError(
-                f"No field_categories preset for schema={schema!r}; pass "
-                f"field_categories explicitly. Presets: {sorted(FIELD_CATEGORY_PRESETS)}.")
-        field_categories = FIELD_CATEGORY_PRESETS[schema]
+    id_columns = list(id_columns or [])
+    reserved = {ROW_ID, *_HARMONIZED_COLS}
+    with_vocab = {f for f, v in vocabs.items() if v.has_vocabulary}
+    clash = [c for c in id_columns if c in reserved or c in with_vocab]
+    if clash:
+        raise ValueError(
+            f"id_columns {clash} clash with columns harmonize() generates "
+            f"({sorted(reserved)}) or with schema fields that have a vocabulary; "
+            f"rename them in the input first.")
+
+    fc = sv.build_field_corpora(vocabs, cache)
+    field_categories = {f: [(c.key, c.ontology_source) for c in cs] for f, cs in fc.items()}
+    corpora = {c.key: c for cs in fc.values() for c in cs}
+    logger.info("[harmonize] %d fields with a vocabulary, %d corpora",
+                len(field_categories), len(corpora))
 
     # ---- Stage A: schema mapping -----------------------------------------
-    sm = _make_schema_engine(input_path, schema=schema, **schema_kwargs)
+    sm = _make_schema_engine(input_path, schema=None, **schema_kwargs)
     schema_map = sm.run_schema_mapping()
     data = sm.df.reset_index(drop=True)  # engine's already-loaded (dtype=str) table
 
-    id_columns = list(id_columns or [])
     missing = [c for c in id_columns if c not in data.columns]
     if missing:
         raise ValueError(f"id_columns not in input: {missing}")
-    samples = pd.concat([pd.DataFrame({"row": range(len(data))}),
+    samples = pd.concat([pd.DataFrame({ROW_ID: range(len(data))}),
                          data[id_columns].reset_index(drop=True)], axis=1)
 
     routing, skipped = _route(schema_map, field_categories, min_schema_score,
@@ -632,7 +631,7 @@ def harmonize(
 
     noise = _noise_values() if drop_noise_values else set()
 
-    # ---- Stage B: ontology mapping, pooled per (category, source) ---------
+    # ---- Stage B: ontology mapping, pooled per corpus ---------------------
     pieces = []
     for (category, source), grp in routing.groupby(
             ["corpus_category", "ontology_source"], sort=False):
@@ -644,12 +643,10 @@ def harmonize(
 
         logger.info("[harmonize] OntoMapEngine(%s, %s): %d values from %d column(s)",
                     category, source, len(pooled), len(col_values))
-        vc = corpora.get(category)
-        kw = dict(onto_kwargs)
-        if vc is not None:
-            kw["corpus_df"] = vc.corpus_df
+        vc = corpora[category]
         try:
-            om = _make_onto_engine(category, pooled, ontology_source=source, **kw)
+            om = _make_onto_engine(category, pooled, ontology_source=source,
+                                   corpus_df=vc.corpus_df, **onto_kwargs)
             om_res = om.run()
         except Exception as exc:  # noqa: BLE001 — isolate one category's failure
             if raise_on_error:
@@ -658,11 +655,10 @@ def harmonize(
             result.errors[(category, source)] = f"{type(exc).__name__}: {exc}"
             continue
 
-        label_ids = {} if (vc is not None and vc.local) else _label_to_term_id(om, source)
-        if "match1" in om_res.columns and (label_ids or (vc is not None and vc.local)):
+        if "match1" in om_res.columns:
             om_res = om_res.copy()
             om_res["match1_term_id"] = (om_res["match1"].astype(str).str.strip()
-                                        .str.lower().map(label_ids).fillna(""))
+                                        .str.lower().map(_label_to_term_id(vc)).fillna(""))
         result.ontology_maps[(category, source)] = om_res
         om_by_value = om_res.rename(columns={"query": "value"})
         for _, route in grp.iterrows():
@@ -679,7 +675,8 @@ def harmonize(
     # ---- Stage C: per-row merge across columns sharing a curated field ----
     h = _build_harmonized(data, routing, result.combined, multi_valued_fields, noise)
     if id_columns and not h.empty:
-        h = h.merge(samples, on="row", how="left")
-        h = h[["row"] + id_columns + [c for c in h.columns if c not in ["row"] + id_columns]]
+        h = h.merge(samples, on=ROW_ID, how="left")
+        lead = [ROW_ID] + id_columns
+        h = h[lead + [c for c in h.columns if c not in lead]]
     result.harmonized = h
     return result

@@ -135,7 +135,7 @@ def run(monkeypatch, tmp_path):
     monkeypatch.setattr(pipeline, "_make_schema_engine", make_sm)
     monkeypatch.setattr(pipeline, "_make_onto_engine", FakeOM)
     monkeypatch.setattr(sv, "_fetch_terms", fake_fetch)
-    res = harmonize("x.csv", schema=None, schema_table=DICT, vocab_cache_dir=tmp_path,
+    res = harmonize("x.csv", DICT, vocab_cache_dir=tmp_path,
                     id_columns=["sid"])
     return res, seen
 
@@ -176,7 +176,7 @@ def test_multi_valued_defaults_from_schema_table(monkeypatch, tmp_path):
     monkeypatch.setattr(pipeline, "_make_onto_engine", FakeOM)
     monkeypatch.setattr(pipeline, "_build_harmonized", spy)
     monkeypatch.setattr(sv, "_fetch_terms", fake_fetch)
-    harmonize("x.csv", schema=None, schema_table=DICT, vocab_cache_dir=tmp_path)
+    harmonize("x.csv", DICT, vocab_cache_dir=tmp_path)
     assert seen["multi"] == {"disease", "hla"}
 
 
@@ -188,3 +188,46 @@ def test_wide_follows_schema_table_field_order(run):
     # local-only vocabulary (sex): labels, no term-ID column
     assert "sex" in w.columns and "sex_ontology_term_id" not in w.columns
     assert "disease_ontology_term_id" in w.columns
+
+
+# --- drafting a schema table from a preset ------------------------------------
+
+def test_draft_schema_table_from_cbio_preset():
+    d = sv.draft_schema_table("cbio")
+    assert list(d.columns) == sv.SCHEMA_TABLE_COLUMNS
+    from metaharmonizer.models.schema_mapper.config import resolve_schema_preset
+    fields = pd.read_csv(resolve_schema_preset("cbio")["target_schema_path"])["field_name"]
+    assert list(d["ColName"]) == list(fields)
+    r = d.set_index("ColName")
+    assert r.loc["cancer_type", "DynamicEnum"] == "NCIT:C3262"
+    assert r.loc["cancer_type", "DynamicEnumProperty"] == "descendant"
+    assert r.loc["body_site", "DynamicEnum"] == "NCIT:C32221"
+    assert r.loc["sex", "AllowedValues"] and r.loc["sex", "DynamicEnum"] == ""
+    assert r.loc["age_at_diagnosis", "ColClass"] == "numeric"
+    # round-trips: read_schema_table sees the same vocabularies
+    v = sv.read_schema_table(d)
+    assert v["cancer_type"].roots == ("NCIT:C3262",)
+    assert v["sex"].allowed_values == tuple(r.loc["sex", "AllowedValues"].split(";"))
+    assert sv.draft_schema_table("cbio", allowed_values=False)["AllowedValues"].eq("").all()
+
+
+def test_draft_skips_allowed_values_that_cannot_round_trip():
+    r = sv.draft_schema_table("gdc").set_index("ColName")
+    # GDC labels such as "Colonization; bacterial" contain the separator
+    assert r.loc["additional_pathology_findings", "AllowedValues"] == ""
+
+
+def test_preset_roots_are_registry_corpora():
+    from metaharmonizer.engine.ontology_mapping_engine import _CORPUS_REGISTRY
+    for fields in sv.PRESET_FIELD_CORPORA.values():
+        assert all(spec in _CORPUS_REGISTRY for spec in fields.values())
+
+
+def test_write_schema_table_draft_copies_preset_dictionaries(tmp_path):
+    p = sv.write_schema_table_draft("cbio", tmp_path / "cbio_schema.csv")
+    assert (tmp_path / "cbio_schema.alias.csv").exists()
+    assert (tmp_path / "cbio_schema.values.json").exists()
+    assert pd.read_csv(p, dtype=str, keep_default_na=False).equals(sv.draft_schema_table("cbio"))
+    with pytest.raises(FileExistsError):
+        sv.write_schema_table_draft("cbio", p)
+    sv.write_schema_table_draft("cbio", p, overwrite=True)

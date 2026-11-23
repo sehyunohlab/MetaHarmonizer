@@ -277,30 +277,51 @@ review) are in the reference sections below and the notebooks under
 
 ### End-to-end (SchemaMapper → OntologyMapper)
 
-`harmonize()` runs both modules in one call. It maps every column with
-`SchemaMapEngine`. Columns whose top-1 curated field is ontology-backed
-(e.g. `disease`, `body_site`, `treatment_name` for `cbio`) and that
-score at least `min_schema_score` go on to `OntoMapEngine`. Columns that
-share a corpus are pooled into one `OntoMapEngine` run.
+`harmonize()` runs both modules in one call. It takes the input table and
+a **schema table**: a data dictionary that lists the curated fields and,
+for each one, where its values come from:
+
+| Column | Meaning |
+|---|---|
+| `ColName` | curated field name (required) |
+| `ColClass` | `numeric`/`integer`/… marks a numeric field |
+| `MultipleValues` | `TRUE` if a sample may hold several values |
+| `DynamicEnum` | ontology root CURIE(s), `;`-separated, e.g. `NCIT:C3262` |
+| `DynamicEnumProperty` | `descendant` (default) or `children` of each root |
+| `AllowedValues` | `;`-separated labels for a closed value set |
+
+The schema table's fields are the SchemaMapper target schema, and each
+field's `DynamicEnum` and `AllowedValues` columns are its OntologyMapper
+corpora. There is one corpus per ontology among the roots, plus a local
+corpus for allowed values that no root contains. Columns whose top-1
+curated field has a vocabulary, and that score at least
+`min_schema_score`, go on to `OntoMapEngine`. Fields without a vocabulary
+are carried over unchanged. Columns that share a corpus are pooled into one
+`OntoMapEngine` run.
 
 ``` python
 from metaharmonizer import harmonize
+from metaharmonizer.schema_vocab import write_schema_table_draft
+
+# Start from a bundled SchemaMapper preset ("cbio" or "gdc"), then edit the
+# DynamicEnum / AllowedValues / MultipleValues columns before using it.
+write_schema_table_draft("cbio", "cbio_schema.csv")
 
 res = harmonize(
     "examples/data/cesc_tcga_before_harmonization.csv",
-    schema="cbio",                         # or "gdc"
+    "cbio_schema.csv",                     # or your own data dictionary
     min_schema_score=0.8,                  # SM match1_score gate (0–1)
     onto_kwargs={"s3_strategy": "rag"},    # forwarded to every OntoMapEngine
-    multi_valued_fields={"treatment_name"},  # fields that may hold several terms
     id_columns=["PATIENT_ID"],             # carried into the per-sample output
 )
 res.schema_map      # SchemaMapEngine output, one row per column
 res.routing         # columns sent to OM, with curated field + corpus
-res.skipped         # ontology-backed columns NOT sent to OM, with reason
+res.skipped         # columns with a vocabulary NOT sent to OM, with reason
 res.ontology_maps   # {(category, ontology_source): OntoMapEngine output}
 res.combined        # one row per (source column, distinct value) + OM matches
 res.harmonized      # one row per (input row, curated field), columns merged
 res.wide()          # one row per input row: <field>, <field>_ontology_term_id
+                    # (rows keyed by metaharmonizer_row_id)
 res.errors          # any OM run that failed (others still complete)
 ```
 
@@ -314,17 +335,24 @@ to the same curated field, `res.harmonized` merges them for each row:
     chosen per row, a lower-scoring column still fills rows where the
     better one is empty. That happens in pooled tables where each study
     uses a different column.
--   *Fields in `multi_valued_fields`*: every column's term is kept,
-    de-duplicated by term ID.
+-   *Multi-valued fields* (`MultipleValues` is `TRUE`, or
+    `multi_valued_fields=`): every column's term is kept, de-duplicated
+    by term ID.
 
 `value` and `term_id` are `;`-joined and paired by position (e.g.
 `Type 2 Diabetes Mellitus;Schizophrenia` ↔ `NCIT:C26747;NCIT:C3362`).
 `source_columns` and `original_value` record where each term came from.
 
-The field → `(corpus_category, ontology_source)` map is
-`metaharmonizer.pipeline.FIELD_CATEGORY_PRESETS`. Pass
-`field_categories=` to override it; this is required with a custom
-`target_schema_path`. Noise values (`unknown`, `not reported`, `na`, …)
+`term_id` is the CURIE the corpus gave for that term (its `obo_id`). It is
+empty for allowed-value labels that have no ontology code.
+
+The draft written by `write_schema_table_draft()` is a starting point. Its
+`DynamicEnum` roots are broad defaults (all of NCIt Neoplasm for each
+disease field), and its `AllowedValues` come from the preset's value
+dictionary. The preset's SchemaMapper alias and value dictionaries are
+copied next to it as `<stem>.alias.csv` and `<stem>.values.json`;
+`harmonize()` picks those up for any schema table that has them.
+Noise values (`unknown`, `not reported`, `na`, …)
 are dropped before ontology mapping unless `drop_noise_values=False`.
 Columns that are mostly numeric (`max_numeric_frac`) or look like
 identifiers (`max_unique_ratio`, e.g. patient IDs and UUIDs) are also
@@ -452,7 +480,7 @@ results = engine.run()
 | `ground_truth_map` | dict | Mapping of query terms to curated ontology values (for evaluation in `test` mode). |
 | `corpus` | list (optional) | Explicit list of corpus terms for **Stage 2 matching only** (Stage 3 always uses `corpus_df`). Auto-derived from `corpus_df` when omitted. |
 | `corpus_df` | DataFrame (optional) | DataFrame with `label` and `obo_id` columns. Auto-loaded from cached CSV or built from API when omitted. |
-| `ontology_source` | str (`"ncit"`) | Ontology backend. Supported `(category, ontology_source)` pairs: `disease`/`bodysite`/`treatment` → `ncit` (NCI Thesaurus via EVSREST); `disease` → `mondo`, `bodysite` → `uberon` (via EBI OLS4 API); `phenotype` → `efo` (pre-built static corpus, no API key needed). When `corpus_df` is provided, this is inferred from code prefixes. |
+| `ontology_source` | str (`"ncit"`) | Ontology backend. Supported `(category, ontology_source)` pairs: `disease`/`bodysite`/`treatment` → `ncit` (NCI Thesaurus via EVSREST); `disease` → `mondo`, `bodysite` → `uberon` (via EBI OLS4 API); `phenotype` → `efo` (pre-built static corpus, no API key needed). When `corpus_df` is provided, omit it (it is read from the code prefixes) or pass the same ontology; a contradicting value raises `ValueError`. |
 | `s2_strategy` | str | Stage 2 strategy — `lm` (CLS-token pooling) or `st` (SentenceTransformer mean pooling). |
 | `s2_method` | str | Transformer model key from `method_model.yaml` (e.g. `sap-bert`, `pubmed-bert`). |
 | `s3_strategy` | str (optional) | Stage 3 strategy — `rag`, `rag_bie`, or `None` to disable. |
@@ -530,8 +558,8 @@ column (`query_df=` and `query_col=`: required for the `rag_bie` Stage-3
 (alpha) strategy). The query column is de-duplicated, stripped, and 
 blank/`nan` values dropped automatically. To bring your own corpus, pass
 `corpus_df=` with a label column (`official_label` or `label`) and a
-code column (`clean_code` or `obo_id`); `ontology_source` is inferred
-from the code prefixes. See [input_formats
+code column (`clean_code` or `obo_id`); `ontology_source` is read
+from the code prefixes (naming a different one raises `ValueError`). See [input_formats
 §1.1–1.3](docs/input_formats.md#11-the-query-required).
 
 ### Interpret outputs

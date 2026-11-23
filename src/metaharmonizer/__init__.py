@@ -39,7 +39,7 @@ def __getattr__(name: str):
     if name == "SchemaMapEngine":
         from metaharmonizer.models.schema_mapper import SchemaMapEngine
         return SchemaMapEngine
-    if name in ("harmonize", "HarmonizeResult", "FIELD_CATEGORY_PRESETS"):
+    if name in ("harmonize", "HarmonizeResult"):
         from metaharmonizer import pipeline
         return getattr(pipeline, name)
     raise AttributeError(f"module 'metaharmonizer' has no attribute {name!r}")
