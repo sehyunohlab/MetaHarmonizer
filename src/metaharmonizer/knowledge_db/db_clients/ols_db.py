@@ -207,11 +207,21 @@ class OLSDb:
                               ontology: str | None = None,
                               page_size: int = 200) -> list[dict]:
         """Fetch all descendant terms of a root term via paginated OLS4 API."""
+        return await self._get_related(obo_id, ontology, "descendants", page_size)
+
+    async def get_children(self, obo_id: str,
+                           ontology: str | None = None,
+                           page_size: int = 200) -> list[dict]:
+        """Fetch the direct children of a term via paginated OLS4 API."""
+        return await self._get_related(obo_id, ontology, "children", page_size)
+
+    async def _get_related(self, obo_id: str, ontology: str | None,
+                           relation: str, page_size: int) -> list[dict]:
         ontology = ontology or self.infer_ontology(obo_id)
         iri = self.obo_id_to_iri(obo_id)
         encoded = quote_plus(quote_plus(iri))
         url = (f"{self._base_url}/ontologies/{ontology}"
-               f"/terms/{encoded}/descendants?size={page_size}")
+               f"/terms/{encoded}/{relation}?size={page_size}")
 
         all_terms: list[dict] = []
         async with httpx.AsyncClient() as client:
@@ -219,7 +229,7 @@ class OLSDb:
                 resp = await self.fetch_one(client, url)
                 if resp is None:
                     raise RuntimeError(
-                        f"OLS get_descendants({obo_id}): page fetch failed "
+                        f"OLS {relation}({obo_id}): page fetch failed "
                         f"after {len(all_terms)} terms. "
                         f"Aborting to avoid an incomplete corpus."
                     )

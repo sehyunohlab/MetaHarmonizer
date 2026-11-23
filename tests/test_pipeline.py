@@ -215,6 +215,9 @@ def merge_case(monkeypatch):
         "hitchip_probe_class": [None, "hpc", None, None, None],
         "disease": ["T2D", "healthy", "T2D", "unknown", "healthy"],
         "study_condition": ["type 2 diabetes", None, "schizophrenia", None, "healthy"],
+        "subject_age": ["30", " 41 ", None, "", "nan"],
+        "age_alt": ["99", None, "52", None, None],
+        "age_noise": ["x"] * 5,
     }, dtype=object)
     schema_map = pd.DataFrame([
         {"query": "sample_id", "stage": "stage1", "match1": "sample_id", "match1_score": 1.0},
@@ -223,6 +226,9 @@ def merge_case(monkeypatch):
         {"query": "hitchip_probe_class", "stage": "stage3", "match1": "body_site", "match1_score": 0.65},
         {"query": "disease", "stage": "stage1", "match1": "disease", "match1_score": 1.0},
         {"query": "study_condition", "stage": "stage3", "match1": "disease", "match1_score": 0.7},
+        {"query": "subject_age", "stage": "stage3", "match1": "age", "match1_score": 0.9},
+        {"query": "age_alt", "stage": "stage3", "match1": "age", "match1_score": 0.7},
+        {"query": "age_noise", "stage": "stage3", "match1": "age", "match1_score": 0.5},
     ])
     monkeypatch.setattr(pipeline, "_make_schema_engine",
                         lambda path, **kw: FakeSM(data, schema_map))
@@ -277,10 +283,36 @@ def test_same_term_from_dropped_column_is_not_a_conflict(merge_case):
 def test_wide_matches_release_layout(merge_case):
     w = merge_case(multi_valued_fields={"disease"}).wide()
     assert list(w.columns) == ["row", "sample_id", "body_site", "body_site_ontology_term_id",
-                               "disease", "disease_ontology_term_id"]
+                               "disease", "disease_ontology_term_id", "age"]
     assert len(w) == 5
     assert w.loc[2, "disease_ontology_term_id"] == "NCIT:C26747;NCIT:C3362"
     assert pd.isna(w.loc[3, "disease"])
+
+
+def test_wide_passes_through_unmapped_fields(merge_case):
+    res = merge_case()
+    assert set(res.passthrough_routing["source_column"]) == {"subject_age", "age_alt"}  # 0.5 < 0.6
+    w = res.wide().set_index("sample_id")
+    # best-scoring column per row, falling back to the next one; blanks are NaN
+    assert w.loc["s1", "age"] == "30" and w.loc["s2", "age"] == "41"
+    assert w.loc["s3", "age"] == "52"
+    assert pd.isna(w.loc["s4", "age"]) and pd.isna(w.loc["s5", "age"])
+    assert "age" not in res.wide(passthrough=False).columns
+
+
+def test_wide_provenance_columns(merge_case):
+    w = merge_case().wide(provenance=True).set_index("sample_id")
+    assert w.loc["s1", "body_site_source_column"] == "body_site"
+    assert w.loc["s1", "body_site_original_value"] == "stool"
+    assert w.loc["s1", "body_site_schema_score"] == 1.0
+    assert w.loc["s1", "body_site_map_score"] == 0.9
+    assert w.loc["s1", "body_site_dropped"] == "disease_location=rectum→rectum"
+    assert w.loc["s4", "body_site_source_column"] == "disease_location"
+    assert w.loc["s4", "body_site_schema_score"] == 0.75
+    assert pd.isna(w.loc["s4", "body_site_dropped"])
+    assert w.loc["s3", "age_source_column"] == "age_alt"
+    assert w.loc["s3", "age_schema_score"] == 0.7
+    assert "age_map_score" not in w.columns            # passthrough: no ontology mapping
 
 
 def test_id_columns_validated(merge_case):
