@@ -35,13 +35,19 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-# Column aliases: data-dictionary name first, MetaHarmonizer name second.
-_NAME_COLS = ("ColName", "field_name")
-_ROOT_COLS = ("DynamicEnum", "ontology_root")
-_PROP_COLS = ("DynamicEnumProperty", "ontology_root_property")
-_ALLOWED_COLS = ("AllowedValues", "allowed_values")
-_MULTI_COLS = ("MultipleValues", "multiple_values")
-_CLASS_COLS = ("ColClass",)
+# Column aliases: data-dictionary names (CamelCase as in the cMD dictionary,
+# dotted lower case as in the cBioPortal one), then MetaHarmonizer's names.
+_NAME_COLS = ("ColName", "col.name", "field_name")
+_ROOT_COLS = ("DynamicEnum", "dynamic.enum", "ontology_root")
+_PROP_COLS = ("DynamicEnumProperty", "dynamic.enum.property", "ontology_root_property")
+_ALLOWED_COLS = ("AllowedValues", "allowedvalues", "allowed_values")
+_MULTI_COLS = ("MultipleValues", "multiplevalues", "multiple_values")
+_CLASS_COLS = ("ColClass", "col.class")
+# Optional: ``corpus.type`` = ``static_enum`` marks AllowedValues as a closed
+# list separated by ``|``, with the term CURIEs of each label, in the same
+# order, in ``static.enum`` (e.g. age_group in the cBioPortal dictionary).
+_CTYPE_COLS = ("CorpusType", "corpus.type")
+_STATIC_COLS = ("StaticEnum", "static.enum")
 _NUMERIC_CLASSES = {"integer", "numeric", "double", "float", "number"}
 
 # Prefix of the codes given to allowed-value labels that have no ontology
@@ -66,6 +72,8 @@ class FieldVocab:
     root_property: str = "descendant"
     allowed_values: Tuple[str, ...] = ()
     multiple_values: bool = False
+    # CURIEs of allowed_values, paired by position ("" where none was given)
+    allowed_codes: Tuple[str, ...] = ()
 
     @property
     def has_vocabulary(self) -> bool:
@@ -80,6 +88,9 @@ class VocabCorpus:
     ontology_source: str        # e.g. "ncit", "hancestro", "local"
     corpus_df: pd.DataFrame = field(repr=False)
     local: bool = False         # codes are LOCAL_*, not real ontology codes
+    # local corpus only: lower-cased label -> CURIE the schema gave it
+    # (``static.enum``); labels without one have no term ID
+    term_ids: Dict[str, str] = field(default_factory=dict, repr=False)
 
 
 def _pick(df: pd.DataFrame, names: Sequence[str]) -> Optional[str]:
@@ -108,6 +119,19 @@ def parse_allowed_values(cell) -> Tuple[str, ...]:
     return tuple(dict.fromkeys(items))
 
 
+def _parse_static_enum(labels_cell, codes_cell, f: str) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+    """Labels and their CURIEs from a ``static_enum`` row (``|``-separated)."""
+    labels = [t.strip() for t in re.split(r"[|;]", _cell(labels_cell)) if t.strip()]
+    codes = [t.strip() for t in re.split(r"[|;]", _cell(codes_cell)) if t.strip()]
+    if codes and len(codes) != len(labels):
+        logger.warning("[schema_vocab] %s: %d static.enum codes for %d labels; codes ignored",
+                       f, len(codes), len(labels))
+        codes = []
+    codes = codes or [""] * len(labels)
+    pairs = dict(zip(labels, codes))  # de-duplicate labels, keep first code
+    return tuple(pairs), tuple(pairs.values())
+
+
 def _parse_roots(cell) -> Tuple[str, ...]:
     s = _cell(cell)
     if not s:
@@ -134,6 +158,7 @@ def read_schema_table(schema_table: Union[str, Path, pd.DataFrame]) -> Dict[str,
                          f"has {list(df.columns)}")
     root_c, prop_c = _pick(df, _ROOT_COLS), _pick(df, _PROP_COLS)
     allow_c, multi_c = _pick(df, _ALLOWED_COLS), _pick(df, _MULTI_COLS)
+    ctype_c, static_c = _pick(df, _CTYPE_COLS), _pick(df, _STATIC_COLS)
     out: Dict[str, FieldVocab] = {}
     for _, r in df.iterrows():
         f = _cell(r[name])
@@ -143,12 +168,19 @@ def read_schema_table(schema_table: Union[str, Path, pd.DataFrame]) -> Dict[str,
         if prop not in {"descendant", "children"}:
             logger.warning("[schema_vocab] %s: unknown root property %r; using descendant", f, prop)
             prop = "descendant"
+        static = ctype_c is not None and _cell(r[ctype_c]).lower() == "static_enum"
+        if static and allow_c:
+            allowed, codes = _parse_static_enum(r[allow_c], r[static_c] if static_c else "", f)
+        else:
+            allowed = parse_allowed_values(r[allow_c]) if allow_c else ()
+            codes = ("",) * len(allowed)
         out[f] = FieldVocab(
             field=f,
             roots=_parse_roots(r[root_c]) if root_c else (),
             root_property=prop,
-            allowed_values=parse_allowed_values(r[allow_c]) if allow_c else (),
+            allowed_values=allowed,
             multiple_values=_to_bool(r[multi_c]) if multi_c else False,
+            allowed_codes=codes,
         )
     return out
 
@@ -258,6 +290,7 @@ def build_corpora(vocab: FieldVocab, cache_dir: Optional[Path] = None,
                                corpus_df=df.reset_index(drop=True)))
         known |= set(df["label"].astype(str).str.strip().str.lower())
 
+    code_of = dict(zip(vocab.allowed_values, vocab.allowed_codes))
     extra = [v for v in vocab.allowed_values if v.strip().lower() not in known]
     if extra:
         fkey = _safe(vocab.field)
@@ -265,8 +298,12 @@ def build_corpora(vocab: FieldVocab, cache_dir: Optional[Path] = None,
             "label": extra,
             "obo_id": [f"{LOCAL_CODE_PREFIX}:{fkey}_{i}" for i in range(len(extra))],
         })
+        # Labels stay a local corpus even when the schema gives their CURIEs
+        # (static.enum): those may span ontologies, and a closed list needs no
+        # concept tables. The CURIEs are kept for the output term IDs.
+        ids = {v.strip().lower(): code_of[v] for v in extra if code_of.get(v)}
         out.append(VocabCorpus(key=_safe("av_" + vocab.field), ontology_source="local",
-                               corpus_df=df, local=True))
+                               corpus_df=df, local=True, term_ids=ids))
     return out
 
 

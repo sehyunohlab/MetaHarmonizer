@@ -104,8 +104,8 @@ class HarmonizeResult:
             - ``curated_field``, ``corpus_category``, ``ontology_source``
             - ``value`` / ``term_id``: ``;``-joined labels and CURIEs, paired by
               position. ``term_id`` is the corpus term's CURIE as the schema
-              vocabulary gave it (``obo_id``), and empty for allowed-value
-              labels that have no ontology code
+              vocabulary gave it (``obo_id``, or ``static.enum`` for an
+              allowed value), and empty for allowed-value labels without one
             - ``original_value`` / ``source_columns``: the kept source values
               and the columns they came from, paired by position
             - ``min_score``: lowest OntoMapEngine ``match1_score`` among kept
@@ -242,11 +242,12 @@ def _label_to_term_id(vc) -> Dict[str, str]:
 
     The CURIE is the corpus's own ``obo_id`` (e.g. ``NCIT:C2965``), not a
     reconstruction from OntoMapEngine's normalized ``clean_code``. Labels
-    shared by several codes keep the first. A local corpus (allowed-value
-    labels without an ontology code) yields ``{}``, so its term IDs are empty.
+    shared by several codes keep the first. For a local corpus
+    (allowed-value labels) only labels the schema gave a CURIE
+    (``static.enum``) have one; the rest get an empty term ID.
     """
     if vc.local:
-        return {}
+        return dict(vc.term_ids)
     df = vc.corpus_df
     out: Dict[str, str] = {}
     for lab, code in zip(df["label"].astype(str), df["obo_id"].astype(str)):

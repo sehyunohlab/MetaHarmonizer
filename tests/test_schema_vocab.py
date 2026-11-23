@@ -231,3 +231,45 @@ def test_write_schema_table_draft_copies_preset_dictionaries(tmp_path):
     with pytest.raises(FileExistsError):
         sv.write_schema_table_draft("cbio", p)
     sv.write_schema_table_draft("cbio", p, overwrite=True)
+
+
+# --- cBioPortal-style dictionary (dotted lower-case headers, static enums) ----
+
+CBIO_DICT = pd.DataFrame({
+    "col.name": ["age_group", "sex", "age_at_death", "cancer_type"],
+    "col.class": ["character", "character", "numeric", "character"],
+    "multiplevalues": ["FALSE", "FALSE", "FALSE", "TRUE"],
+    "allowedvalues": ["Infant|Adult|Elderly", "Female;Male", "[0-9]+", "NA"],
+    "dynamic.enum": ["NA", "NA", "NA", "NCIT:C3262"],
+    "dynamic.enum.property": ["NA", "NA", "NA", "descendant"],
+    "corpus.type": ["static_enum", "NA", "regexp", "dynamic_enum"],
+    "static.enum": ["NCIT:C27956|NCIT:C17600|NCIT:C16268", "NA", "NA", "NA"],
+})
+
+
+def test_reads_dotted_headers_and_static_enum_codes():
+    v = sv.read_schema_table(CBIO_DICT)
+    assert v["age_group"].allowed_values == ("Infant", "Adult", "Elderly")
+    assert v["age_group"].allowed_codes == ("NCIT:C27956", "NCIT:C17600", "NCIT:C16268")
+    assert v["sex"].allowed_values == ("Female", "Male") and v["sex"].allowed_codes == ("", "")
+    assert not v["age_at_death"].has_vocabulary
+    assert v["cancer_type"].roots == ("NCIT:C3262",) and v["cancer_type"].multiple_values
+    ts = sv.target_schema_frame(CBIO_DICT).set_index("field_name")
+    assert ts.loc["age_at_death", "is_numeric_field"] == "yes"
+    assert ts.loc["cancer_type", "ontology_root"] == "NCIT:C3262"
+
+
+def test_static_enum_with_mismatched_codes_keeps_labels_only():
+    d = CBIO_DICT.copy()
+    d.loc[0, "static.enum"] = "NCIT:C27956"
+    v = sv.read_schema_table(d)["age_group"]
+    assert len(v.allowed_values) == 3 and v.allowed_codes == ("", "", "")
+
+
+def test_static_enum_codes_become_term_ids(monkeypatch, tmp_path):
+    (c,) = sv.build_corpora(sv.read_schema_table(CBIO_DICT)["age_group"], tmp_path)
+    assert c.local and c.corpus_df["obo_id"].str.startswith("LOCAL:").all()
+    assert pipeline._label_to_term_id(c) == {"infant": "NCIT:C27956", "adult": "NCIT:C17600",
+                                             "elderly": "NCIT:C16268"}
+    (s,) = sv.build_corpora(sv.read_schema_table(CBIO_DICT)["sex"], tmp_path)
+    assert pipeline._label_to_term_id(s) == {}
