@@ -8,9 +8,17 @@ the vocabulary its values come from. Two columns carry that vocabulary:
   ``DynamicEnumProperty`` = ``descendant`` (default) the vocabulary is every
   descendant of each root plus the root; with ``children`` it is the direct
   children only.
-- ``AllowedValues``: a ``;``-separated list of permitted labels, e.g.
-  ``Female;Male``. A value that is a regular expression (``[0-9]+``, ``.+``)
-  describes a format, not a vocabulary, and is ignored.
+- ``AllowedValues``: permitted labels. With a ``corpus.type`` column (the
+  schema registry convention), a ``static_enum`` or ``custom_enum`` row holds a
+  ``|`` list (``Female|Male``) and ``static.enum`` the CURIE of each label, in
+  the same order, with an empty slot for a label without one; other rows hold
+  no labels. A ``static_enum`` row with IDs but no labels adds those terms as
+  they are (``Healthy``: ``NCIT:C115935``). Without ``corpus.type`` (the older
+  cMD layout) the list is ``;``-separated, e.g. ``Female;Male``, and a value
+  that is a regular expression (``[0-9]+``, ``.+``) describes a format, not a
+  vocabulary, and is ignored. See :mod:`metaharmonizer.schema_cells`, which
+  :class:`~metaharmonizer.knowledge_db.combined_corpus_builder.CombinedCorpusBuilder`
+  shares.
 
 :func:`read_schema_table` parses such a table into :class:`FieldVocab` records,
 :func:`target_schema_frame` turns it into the target-schema CSV layout that
@@ -33,6 +41,8 @@ from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Uni
 
 import pandas as pd
 
+from metaharmonizer.schema_cells import REGEX_SIGNS, _legacy_labels, cell as _cell, read_row_values
+
 logger = logging.getLogger(__name__)
 
 # Column aliases: data-dictionary names (CamelCase as in the cMD dictionary,
@@ -43,9 +53,9 @@ _PROP_COLS = ("DynamicEnumProperty", "dynamic.enum.property", "ontology_root_pro
 _ALLOWED_COLS = ("AllowedValues", "allowedvalues", "allowed_values")
 _MULTI_COLS = ("MultipleValues", "multiplevalues", "multiple_values")
 _CLASS_COLS = ("ColClass", "col.class")
-# Optional: ``corpus.type`` = ``static_enum`` marks AllowedValues as a closed
-# list separated by ``|``, with the term CURIEs of each label, in the same
-# order, in ``static.enum`` (e.g. age_group in the cBioPortal dictionary).
+# Optional: ``corpus.type`` decides how AllowedValues is read (see
+# metaharmonizer.schema_cells); ``static.enum`` holds the term CURIEs of each
+# label, in the same order (e.g. age_group in the cBioPortal dictionary).
 _CTYPE_COLS = ("CorpusType", "corpus.type")
 _STATIC_COLS = ("StaticEnum", "static.enum")
 _NUMERIC_CLASSES = {"integer", "numeric", "double", "float", "number"}
@@ -55,12 +65,6 @@ _NUMERIC_CLASSES = {"integer", "numeric", "double", "float", "number"}
 # local corpus (no concept tables); harmonize() leaves their term_id empty.
 LOCAL_CODE_PREFIX = "LOCAL"
 
-# Signs that an AllowedValues item is a pattern, not a label: a character
-# class, an escape, anchors, a counted repeat, ``.+``/``.*``, an optional
-# group, or alternation. Plain ``*`` or ``(...)`` occur in real labels
-# (``HLA-DQA1*02:01 protein complex``, ``smoker (finding)``).
-_REGEX_SIGNS = re.compile(r"\[[^\]]*\]|\\[a-zA-Z.]|^\^|\$$|\{\d+(,\d*)?\}|\.[+*]|\)\?|\|")
-_NULLS = {"", "na", "nan", "none", "null"}
 
 
 @dataclass(frozen=True)
@@ -74,10 +78,12 @@ class FieldVocab:
     multiple_values: bool = False
     # CURIEs of allowed_values, paired by position ("" where none was given)
     allowed_codes: Tuple[str, ...] = ()
+    # static.enum CURIEs given without labels: each term is added as it is
+    static_terms: Tuple[str, ...] = ()
 
     @property
     def has_vocabulary(self) -> bool:
-        return bool(self.roots or self.allowed_values)
+        return bool(self.roots or self.allowed_values or self.static_terms)
 
 
 @dataclass
@@ -97,39 +103,14 @@ def _pick(df: pd.DataFrame, names: Sequence[str]) -> Optional[str]:
     return next((c for c in names if c in df.columns), None)
 
 
-def _cell(v) -> str:
-    if v is None or (isinstance(v, float) and pd.isna(v)):
-        return ""
-    v = str(v).strip()
-    return "" if v.lower() in _NULLS else v
-
-
 def parse_allowed_values(cell) -> Tuple[str, ...]:
-    """Labels from an ``AllowedValues`` cell, or ``()`` for a pattern.
+    """Labels from a ``;``-separated ``AllowedValues`` cell (the layout without
+    ``corpus.type``), or ``()`` for a pattern.
 
     The whole cell is treated as a pattern (and ignored) when any item looks
     like a regular expression, e.g. ``[0-9]+|NA`` or ``.+``.
     """
-    s = _cell(cell)
-    if not s:
-        return ()
-    items = [t.strip() for t in s.split(";") if t.strip()]
-    if any(_REGEX_SIGNS.search(t) for t in items):
-        return ()
-    return tuple(dict.fromkeys(items))
-
-
-def _parse_static_enum(labels_cell, codes_cell, f: str) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
-    """Labels and their CURIEs from a ``static_enum`` row (``|``-separated)."""
-    labels = [t.strip() for t in re.split(r"[|;]", _cell(labels_cell)) if t.strip()]
-    codes = [t.strip() for t in re.split(r"[|;]", _cell(codes_cell)) if t.strip()]
-    if codes and len(codes) != len(labels):
-        logger.warning("[schema_vocab] %s: %d static.enum codes for %d labels; codes ignored",
-                       f, len(codes), len(labels))
-        codes = []
-    codes = codes or [""] * len(labels)
-    pairs = dict(zip(labels, codes))  # de-duplicate labels, keep first code
-    return tuple(pairs), tuple(pairs.values())
+    return tuple(dict.fromkeys(_legacy_labels(cell, ";")))
 
 
 def _parse_roots(cell) -> Tuple[str, ...]:
@@ -168,19 +149,17 @@ def read_schema_table(schema_table: Union[str, Path, pd.DataFrame]) -> Dict[str,
         if prop not in {"descendant", "children"}:
             logger.warning("[schema_vocab] %s: unknown root property %r; using descendant", f, prop)
             prop = "descendant"
-        static = ctype_c is not None and _cell(r[ctype_c]).lower() == "static_enum"
-        if static and allow_c:
-            allowed, codes = _parse_static_enum(r[allow_c], r[static_c] if static_c else "", f)
-        else:
-            allowed = parse_allowed_values(r[allow_c]) if allow_c else ()
-            codes = ("",) * len(allowed)
+        rv = read_row_values(r[ctype_c] if ctype_c else "",
+                             r[allow_c] if allow_c else "",
+                             r[static_c] if static_c else "", f)
         out[f] = FieldVocab(
             field=f,
             roots=_parse_roots(r[root_c]) if root_c else (),
             root_property=prop,
-            allowed_values=allowed,
+            allowed_values=rv.labels,
             multiple_values=_to_bool(r[multi_c]) if multi_c else False,
-            allowed_codes=codes,
+            allowed_codes=rv.codes,
+            static_terms=rv.static_terms,
         )
     return out
 
@@ -218,7 +197,8 @@ def _safe(s: str) -> str:
 
 def _fetch_terms(root: str, relation: str) -> List[dict]:
     """Descendants or children of a root from OLS (the root itself excluded:
-    it names the category, e.g. ``Menopause Status``, not a value). An
+    it names the category, e.g. ``Menopause Status``, not a value), or with
+    ``relation="self"`` the term itself (a standalone ``static.enum`` term). An
     obsolete root yields nothing."""
     from metaharmonizer.knowledge_db.corpus_builder import CorpusBuilder
     from metaharmonizer.knowledge_db.db_clients.ols_db import OLSDb
@@ -232,6 +212,8 @@ def _fetch_terms(root: str, relation: str) -> List[dict]:
             logger.warning("[schema_vocab] root %s is obsolete in OLS (%r); skipped",
                            root, root_raw.get("label"))
             return []
+        if relation == "self":
+            return [parse(root_raw)]
         get = ols.get_children if relation == "children" else ols.get_descendants
         rel = await get(root)
         return [parse(t) for t in rel]
@@ -267,18 +249,21 @@ def build_corpora(vocab: FieldVocab, cache_dir: Optional[Path] = None,
                   fetch: Optional[Callable[[str, str], List[dict]]] = None) -> List[VocabCorpus]:
     """OntoMapEngine corpora for one field.
 
-    One corpus per ontology prefix among the field's roots, keyed by the roots
-    (so fields with the same roots share it), plus a local corpus for allowed
-    values whose label is not already in those corpora.
+    One corpus per ontology prefix among the field's roots and standalone
+    ``static.enum`` terms, keyed by them (so fields with the same roots share
+    it), plus a local corpus for allowed values whose label is not already in
+    those corpora.
     """
     by_prefix: Dict[str, List[Tuple[str, pd.DataFrame]]] = {}
-    for root in vocab.roots:
+    sources = [(r, vocab.root_property, r) for r in vocab.roots]
+    sources += [(t, "self", "s_" + t) for t in vocab.static_terms if t not in vocab.roots]
+    for root, relation, name in sources:
         if ":" not in root:
-            logger.warning("[schema_vocab] %s: root %r is not a CURIE; skipped", vocab.field, root)
+            logger.warning("[schema_vocab] %s: %r is not a CURIE; skipped", vocab.field, root)
             continue
-        df = root_corpus(root, vocab.root_property, cache_dir, fetch)
+        df = root_corpus(root, relation, cache_dir, fetch)
         if not df.empty:
-            by_prefix.setdefault(root.split(":", 1)[0].upper(), []).append((root, df))
+            by_prefix.setdefault(root.split(":", 1)[0].upper(), []).append((name, df))
 
     out: List[VocabCorpus] = []
     known = set()
@@ -400,7 +385,7 @@ def draft_schema_table(schema: str, allowed_values: bool = True) -> pd.DataFrame
         spec = corpora.get(f)
         root = _CORPUS_REGISTRY[spec] if spec else ""
         labels = [str(v).strip() for v in values.get(f, []) if str(v).strip()]
-        if any(";" in v or _REGEX_SIGNS.search(v) for v in labels):
+        if any(";" in v or "|" in v or REGEX_SIGNS.search(v) for v in labels):
             unreadable.append(f)
             labels = []
         rows.append({
