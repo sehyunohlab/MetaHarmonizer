@@ -336,14 +336,21 @@ def _build_harmonized(
 
 def _best_per_value(combined: pd.DataFrame) -> pd.DataFrame:
     """Keep, per ``(source_column, value)``, the row with the highest
-    ``match1_score`` (a column routed to several corpora gets one answer)."""
+    ``match1_score`` (a column routed to several corpora gets one answer).
+
+    On a tied score, a local-corpus match whose term ID the schema gave
+    (``static.enum``) wins: when an allowed value's label is also an ontology
+    term with a different ID, the schema's explicit ID is kept."""
     if combined.empty or not combined.duplicated(["source_column", "value"]).any():
         return combined
     score = pd.to_numeric(combined.get("match1_score"), errors="coerce").fillna(-1.0)
-    order = combined.assign(_s=score, _i=range(len(combined))) \
-                    .sort_values(["_s", "_i"], ascending=[False, True])
+    src = combined.get("ontology_source", pd.Series("", index=combined.index))
+    tid = combined.get("match1_term_id", pd.Series("", index=combined.index))
+    static = (src.astype(str) == "local") & (tid.fillna("").astype(str) != "")
+    order = combined.assign(_s=score, _p=static.astype(int), _i=range(len(combined))) \
+                    .sort_values(["_s", "_p", "_i"], ascending=[False, False, True])
     best = order.drop_duplicates(["source_column", "value"]).sort_values("_i")
-    return best.drop(columns=["_s", "_i"]).reset_index(drop=True)
+    return best.drop(columns=["_s", "_p", "_i"]).reset_index(drop=True)
 
 
 def _clean_values(series: pd.Series, noise: Iterable[str]) -> List[str]:

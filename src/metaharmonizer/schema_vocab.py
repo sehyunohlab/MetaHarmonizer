@@ -251,8 +251,9 @@ def build_corpora(vocab: FieldVocab, cache_dir: Optional[Path] = None,
 
     One corpus per ontology prefix among the field's roots and standalone
     ``static.enum`` terms, keyed by them (so fields with the same roots share
-    it), plus a local corpus for allowed values whose label is not already in
-    those corpora.
+    it), plus a local corpus for allowed values those corpora do not already
+    cover: a label they lack, or a label they have under a different ID than
+    the value's ``static.enum`` one (both entries are then kept).
     """
     by_prefix: Dict[str, List[Tuple[str, pd.DataFrame]]] = {}
     sources = [(r, vocab.root_property, r) for r in vocab.roots]
@@ -266,17 +267,29 @@ def build_corpora(vocab: FieldVocab, cache_dir: Optional[Path] = None,
             by_prefix.setdefault(root.split(":", 1)[0].upper(), []).append((name, df))
 
     out: List[VocabCorpus] = []
-    known = set()
+    known: Dict[str, set] = {}   # lower-cased label -> upper-cased obo_ids
     for prefix, parts in by_prefix.items():
         df = pd.concat([d for _, d in parts], ignore_index=True).drop_duplicates("obo_id")
         key = _safe("v_" + "_".join(r for r, _ in parts)
                     + ("_children" if vocab.root_property == "children" else ""))
         out.append(VocabCorpus(key=key, ontology_source=prefix.lower(),
                                corpus_df=df.reset_index(drop=True)))
-        known |= set(df["label"].astype(str).str.strip().str.lower())
+        for lab, code in zip(df["label"].astype(str), df["obo_id"].astype(str)):
+            known.setdefault(lab.strip().lower(), set()).add(code.strip().upper())
 
     code_of = dict(zip(vocab.allowed_values, vocab.allowed_codes))
-    extra = [v for v in vocab.allowed_values if v.strip().lower() not in known]
+
+    def covered(v: str) -> bool:
+        # A dynamic term covers an allowed value when the labels match and the
+        # schema gives the value no static.enum ID or the same one. A different
+        # ID is an explicit mapping, so the value stays in the local corpus.
+        ids = known.get(v.strip().lower())
+        if ids is None:
+            return False
+        code = code_of.get(v, "").strip()
+        return not code or code.upper() in ids
+
+    extra = [v for v in vocab.allowed_values if not covered(v)]
     if extra:
         fkey = _safe(vocab.field)
         df = pd.DataFrame({

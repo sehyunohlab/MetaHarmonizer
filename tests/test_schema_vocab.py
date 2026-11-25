@@ -273,3 +273,44 @@ def test_static_enum_codes_become_term_ids(monkeypatch, tmp_path):
                                              "elderly": "NCIT:C16268"}
     (s,) = sv.build_corpora(sv.read_schema_table(CBIO_DICT)["sex"], tmp_path)
     assert pipeline._label_to_term_id(s) == {}
+
+
+# --- allowed values whose label is also a dynamic term (PR #108 review) ------
+
+CONFLICT_DICT = pd.DataFrame({
+    "col.name": ["status"],
+    "allowedvalues": ["Healthy|Crohn Disease|Remission"],
+    "dynamic.enum": ["NCIT:C7057"],
+    "dynamic.enum.property": ["descendant"],
+    "corpus.type": ["static_enum"],
+    # Healthy: different ID than the dynamic term; Crohn Disease: same ID;
+    # Remission: not in the dynamic corpus
+    "static.enum": ["NCIT:C999999|NCIT:C2965|NCIT:C4870"],
+})
+
+
+def test_allowed_value_with_a_different_static_id_keeps_both_entries(tmp_path):
+    ont, loc = sv.build_corpora(sv.read_schema_table(CONFLICT_DICT)["status"],
+                                tmp_path, fake_fetch)
+    assert "Healthy" in set(ont.corpus_df["label"])            # dynamic entry kept
+    assert list(loc.corpus_df["label"]) == ["Healthy", "Remission"]
+    assert loc.term_ids == {"healthy": "NCIT:C999999", "remission": "NCIT:C4870"}
+
+
+def test_allowed_value_without_static_id_is_still_covered_by_dynamic_label(tmp_path):
+    _, loc = sv.build_field_corpora(sv.read_schema_table(DICT), tmp_path, fake_fetch)["hla"]
+    assert list(loc.corpus_df["label"]) == ["Novel HLA"]
+
+
+def test_static_id_wins_a_tie_with_the_dynamic_term(monkeypatch, tmp_path):
+    data = pd.DataFrame({"st": ["healthy", "crohn disease"]}, dtype=str)
+    sm = pd.DataFrame([{"query": "st", "stage": "stage1", "match1": "status",
+                        "match1_score": 1.0}])
+    monkeypatch.setattr(pipeline, "_make_schema_engine", lambda p, **k: FakeSM(data, sm))
+    monkeypatch.setattr(pipeline, "_make_onto_engine", FakeOM)
+    monkeypatch.setattr(sv, "_fetch_terms", fake_fetch)
+    res = harmonize("x.csv", CONFLICT_DICT, vocab_cache_dir=tmp_path)
+    c = res.combined.set_index("value")
+    assert c.loc["healthy", "match1_term_id"] == "NCIT:C999999"
+    assert c.loc["healthy", "ontology_source"] == "local"
+    assert c.loc["crohn disease", "match1_term_id"] == "NCIT:C2965"
