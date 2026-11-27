@@ -122,8 +122,9 @@ The engine enforces *structural* correctness, not semantic adequacy:
 -   **Single-ontology partitioning** — for a caller-provided corpus,
     codes are partitioned by prefix (`_partition_codes`); a corpus
     mixing prefixes from more than one ontology is rejected. The single
-    detected source overrides the declared `ontology_source` (with a
-    warning).
+    detected source becomes `ontology_source` when the caller omits it;
+    a caller-named `ontology_source` that contradicts it raises
+    `ValueError` instead of being overridden.
 -   **Cache isolation by content hash** — a caller-provided corpus is
     MD5-hashed; if it differs from the official corpus, a `_{hash}`
     suffix is appended to the SQLite table / FAISS index names so a

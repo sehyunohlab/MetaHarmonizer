@@ -49,6 +49,7 @@ from metaharmonizer.custom_logger.custom_logger import CustomLogger
 from metaharmonizer.knowledge_db.corpus_builder import CorpusBuilder
 from metaharmonizer.knowledge_db.db_clients.ols_db import OLSDb
 from metaharmonizer._async_utils import run_async
+from metaharmonizer.schema_cells import _legacy_labels, read_row_values
 
 # Column order expected by OntoMapEngine's corpus CSV loader
 # (mirrors OntoMapEngine._build_ols_corpus_csv).
@@ -90,27 +91,26 @@ def _split_enum_field(value) -> list[str]:
     return [t.strip() for t in text.split("|") if t.strip() not in ("", "NA")]
 
 
-# Regex metacharacters that mark an `allowedvalues` cell as a pattern rather
-# than an enum list. Mirrors the discrimination in build_schema_artifacts.py
-# and tableToLinkmlSchema() so the three stay consistent.
-_ALLOWEDVALUES_REGEX_RE = re.compile(r"^\^|\$$|\[|\]|\{|\}|\+")
-
-
 def _split_allowedvalues_enum(value) -> list[str]:
-    """Return the enum labels in an ``allowedvalues`` cell, or ``[]``.
+    """Return the enum labels in an ``allowedvalues`` cell read without
+    ``corpus.type``, or ``[]``.
 
     Empty / ``NA`` cells and regex patterns yield ``[]`` (regex fields are
     validation-only and never populate the corpus). A ``|``-list yields its
-    trimmed labels.
+    trimmed labels. Rows with ``corpus.type`` are read by
+    :func:`metaharmonizer.schema_cells.read_row_values`, which decides from the
+    type instead of guessing.
     """
-    if value is None or (isinstance(value, float) and pd.isna(value)):
-        return []
-    text = str(value).strip()
-    if text in ("", "NA"):
-        return []
-    if _ALLOWEDVALUES_REGEX_RE.search(text):
-        return []
-    return [t.strip() for t in text.split("|") if t.strip() not in ("", "NA")]
+    return list(_legacy_labels(value, "|"))
+
+
+def _row_values(get):
+    """Labels, positional IDs and standalone terms of a row, read the same way
+    as :mod:`metaharmonizer.schema_vocab` (``|`` lists; without ``corpus.type``,
+    the legacy ``|`` reading)."""
+    return read_row_values(get("corpus.type"), get("allowedvalues"),
+                           get("static.enum"), str(get("col.name") or ""),
+                           legacy_sep="|")
 
 
 class CombinedCorpusBuilder:
@@ -234,10 +234,12 @@ class CombinedCorpusBuilder:
 
         1. ``dynamic.enum`` roots -> descendant (or direct-child) branch;
         2. ``allowedvalues`` enum labels -> one record each. When ``static.enum``
-           supplies a positional id for a label (custom/static enum), the label
-           is bound to that id and, if *fetch_static_synonyms*, enriched with the
-           ontology term's synonyms; custom labels with no id become free-text
-           records (empty ``obo_id``);
+           supplies a positional id for a label (``static_enum``; an empty slot
+           means no id for that label), the label is bound to that id and, if
+           *fetch_static_synonyms*, enriched with the ontology term's synonyms;
+           labels with no id become free-text records (empty ``obo_id``).
+           ``corpus.type`` decides whether ``allowedvalues`` is a list (see
+           :mod:`metaharmonizer.schema_cells`);
         3. ``static.enum`` standalone terms -> fetched as-is (the combined
            ``dynamic_enum|static_enum`` case, where ``allowedvalues`` is empty and
            ``static.enum`` holds extra ontology terms such as "Healthy").
@@ -272,22 +274,19 @@ class CombinedCorpusBuilder:
             ))
 
         # 2 & 3. allowedvalues enum labels and static.enum terms
-        av_labels = _split_allowedvalues_enum(get("allowedvalues"))
-        se_tokens = _split_enum_field(get("static.enum"))
+        rv = _row_values(get)
+        av_labels, se_tokens = rv.labels, rv.static_terms
 
         if av_labels:
-            # static.enum is positional to the labels when the counts line up
-            # (custom_enum / static_enum); otherwise labels are id-less.
-            positional = se_tokens if len(se_tokens) == len(av_labels) else []
-            fetch_ids = [normalize_obo_id(t) for t in positional if t] \
-                if fetch_static_synonyms else []
+            # rv.codes pairs static.enum with the labels by position ("" where
+            # a label has no id).
+            ids = [normalize_obo_id(c) if c else "" for c in rv.codes]
+            fetch_ids = [i for i in ids if i] if fetch_static_synonyms else []
             id_to_rec = {}
             if fetch_ids:
                 id_to_rec = {r["obo_id"]: r
                              for r in self._fetch_single_records(fetch_ids)}
-            for i, label in enumerate(av_labels):
-                raw_id = positional[i] if i < len(positional) else ""
-                oid = normalize_obo_id(raw_id) if raw_id else ""
+            for label, oid in zip(av_labels, ids):
                 records.append(self._label_record(label, oid, id_to_rec.get(oid)))
         elif se_tokens:
             # combined field: static.enum holds standalone terms, no labels
@@ -611,11 +610,10 @@ def field_has_corpus_layer(row) -> bool:
     ``static.enum``. Regex-only / plain fields have no target corpus.
     """
     get = row.get if hasattr(row, "get") else (lambda k, d=None: row[k] if k in row else d)
-    return bool(
-        _split_enum_field(get("dynamic.enum"))
-        or _split_allowedvalues_enum(get("allowedvalues"))
-        or _split_enum_field(get("static.enum"))
-    )
+    if _split_enum_field(get("dynamic.enum")):
+        return True
+    rv = _row_values(get)
+    return bool(rv.labels or rv.static_terms)
 
 
 def build_schema_corpus(

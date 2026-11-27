@@ -1,9 +1,21 @@
-"""Tests for metaharmonizer.pipeline.harmonize — engines are faked, no models load."""
+"""Tests for metaharmonizer.pipeline.harmonize — OLS and engines are faked, no models load."""
 import pandas as pd
 import pytest
 
-from metaharmonizer import pipeline
-from metaharmonizer.pipeline import FIELD_CATEGORY_PRESETS, harmonize
+from metaharmonizer import pipeline, schema_vocab as sv
+from metaharmonizer.pipeline import ROW_ID, harmonize
+
+
+def schema(**roots):
+    """A schema table: field -> DynamicEnum root ('' for no vocabulary)."""
+    return pd.DataFrame({"ColName": list(roots), "DynamicEnum": list(roots.values()),
+                         "DynamicEnumProperty": ["descendant" if r else "" for r in roots.values()]})
+
+
+def fake_fetch(table):
+    def fetch(root, relation):
+        return [{"label": lab, "obo_id": code} for lab, code in table[root]]
+    return fetch
 
 
 class FakeSM:
@@ -16,26 +28,36 @@ class FakeSM:
 
 
 class FakeOM:
+    """Returns the corpus label equal to the query, else the first label."""
     calls = []
 
     def __init__(self, category, query_ls, **kwargs):
         FakeOM.calls.append((category, list(query_ls), kwargs))
-        self.category = category
         self.query_ls = list(query_ls)
+        self.labels = list(kwargs["corpus_df"]["label"])
         if kwargs.get("fail"):
             raise RuntimeError("corpus unavailable")
 
     def run(self):
-        return pd.DataFrame({
-            "query": self.query_ls,
-            "match1": [f"{self.category}:{q.upper()}" for q in self.query_ls],
-            "match1_score": [0.9] * len(self.query_ls),
-            "stage": [2.0] * len(self.query_ls),
-        })
+        hit = [next((l for l in self.labels if l.lower() == q.lower()), self.labels[0])
+               for q in self.query_ls]
+        return pd.DataFrame({"query": self.query_ls, "match1": hit,
+                             "match1_score": [0.9] * len(hit), "stage": [2.0] * len(hit)})
+
+
+CBIO_TERMS = {
+    "NCIT:C3262": [("Lung Adenocarcinoma", "NCIT:C3512"), ("Melanoma", "NCIT:C3224"),
+                   ("Breast Carcinoma", "NCIT:C4872")],
+    "NCIT:C32221": [("Lung", "NCIT:C12468"), ("Skin", "NCIT:C12470")],
+    "NCIT:C1909": [("Cisplatin", "NCIT:C376")],
+}
+CBIO = schema(disease="NCIT:C3262", cancer_type="NCIT:C3262", body_site="NCIT:C32221",
+              treatment_name="NCIT:C1909", age_at_diagnosis="")
+DISEASE, BODYSITE = "v_ncit_c3262", "v_ncit_c32221"
 
 
 @pytest.fixture
-def patched(monkeypatch):
+def patched(monkeypatch, tmp_path):
     FakeOM.calls = []
     data = pd.DataFrame({
         "Diagnosis": ["lung adenocarcinoma", "Unknown", None, " melanoma "],
@@ -59,36 +81,43 @@ def patched(monkeypatch):
 
     monkeypatch.setattr(pipeline, "_make_schema_engine", make_sm)
     monkeypatch.setattr(pipeline, "_make_onto_engine", FakeOM)
+    monkeypatch.setattr(sv, "_fetch_terms", fake_fetch(CBIO_TERMS))
+    seen["run"] = lambda table=CBIO, **kw: harmonize("x.csv", table, vocab_cache_dir=tmp_path, **kw)
     return seen
 
 
-def test_routing_gates_on_preset_and_score(patched):
-    res = harmonize("x.csv", schema="cbio")
+def test_routing_gates_on_vocabulary_and_score(patched):
+    res = patched["run"]()
     assert list(res.routing["source_column"]) == ["Diagnosis", "Tumor Type", "Site"]
-    # Drug: score 0.3 < 0.8; Age: not ontology-backed (so not in skipped either)
+    # Drug: score 0.3 < 0.8; Age: field has no vocabulary (so not in skipped either)
     assert "Drug" not in set(res.combined["source_column"])
     assert list(res.skipped["source_column"]) == ["Drug"]
     assert res.skipped["reason"].iloc[0].startswith("schema score")
-    assert patched["sm_kwargs"]["schema"] == "cbio"
+    # the schema table is the SchemaMapper target schema; no preset is selected
+    assert patched["sm_kwargs"]["schema"] is None
+    ts = pd.read_csv(patched["sm_kwargs"]["target_schema_path"])
+    assert list(ts["field_name"]) == list(CBIO["ColName"])
 
 
-def test_columns_sharing_a_category_are_pooled_into_one_run(patched):
-    res = harmonize("x.csv", schema="cbio")
+def test_fields_sharing_a_corpus_are_pooled_into_one_run(patched):
+    res = patched["run"]()
     cats = [c[0] for c in FakeOM.calls]
-    assert sorted(cats) == ["bodysite", "disease"]  # one run each
-    disease_vals = next(q for c, q, _ in FakeOM.calls if c == "disease")
+    assert sorted(cats) == sorted([DISEASE, BODYSITE])  # one run each
+    disease_vals = next(q for c, q, _ in FakeOM.calls if c == DISEASE)
     # deduped across Diagnosis + Tumor Type, stripped, noise/empty dropped
     assert disease_vals == ["lung adenocarcinoma", "melanoma", "breast carcinoma"]
-    assert set(res.ontology_maps) == {("disease", "ncit"), ("bodysite", "ncit")}
-    assert all(kw["ontology_source"] == "ncit" for _, _, kw in FakeOM.calls)
+    assert set(res.ontology_maps) == {(DISEASE, "ncit"), (BODYSITE, "ncit")}
+    for _, _, kw in FakeOM.calls:
+        assert kw["ontology_source"] == "ncit"
+        assert kw["corpus_df"]["obo_id"].str.startswith("NCIT:").all()
 
 
 def test_combined_has_one_row_per_column_value(patched):
-    res = harmonize("x.csv", schema="cbio")
-    c = res.combined
+    c = patched["run"]().combined
     diag = c[c["source_column"] == "Diagnosis"]
     assert list(diag["value"]) == ["lung adenocarcinoma", "melanoma"]
-    assert list(diag["match1"]) == ["disease:LUNG ADENOCARCINOMA", "disease:MELANOMA"]
+    assert list(diag["match1"]) == ["Lung Adenocarcinoma", "Melanoma"]
+    assert list(diag["match1_term_id"]) == ["NCIT:C3512", "NCIT:C3224"]
     tumor = c[c["source_column"] == "Tumor Type"]
     assert list(tumor["value"]) == ["melanoma", "breast carcinoma"]
     assert (tumor["curated_field"] == "cancer_type").all()
@@ -97,7 +126,7 @@ def test_combined_has_one_row_per_column_value(patched):
         "corpus_category", "ontology_source", "value"]
 
 
-def test_numeric_and_identifier_columns_are_skipped(monkeypatch):
+def test_numeric_and_identifier_columns_are_skipped(monkeypatch, tmp_path):
     FakeOM.calls = []
     n = 30
     data = pd.DataFrame({
@@ -107,68 +136,72 @@ def test_numeric_and_identifier_columns_are_skipped(monkeypatch):
     }, dtype=str)
     schema_map = pd.DataFrame([
         {"query": "patientId", "stage": "stage3", "match1": "body_site", "match1_score": 0.9},
-        {"query": "MUTATION_COUNT", "stage": "stage3", "match1": "cancer_subtype", "match1_score": 0.9},
+        {"query": "MUTATION_COUNT", "stage": "stage3", "match1": "cancer_type", "match1_score": 0.9},
         {"query": "Diagnosis", "stage": "stage1", "match1": "disease", "match1_score": 1.0},
     ])
     monkeypatch.setattr(pipeline, "_make_schema_engine",
                         lambda path, **kw: FakeSM(data, schema_map))
     monkeypatch.setattr(pipeline, "_make_onto_engine", FakeOM)
+    monkeypatch.setattr(sv, "_fetch_terms", fake_fetch(CBIO_TERMS))
 
-    res = harmonize("x.csv", schema="cbio")
+    res = harmonize("x.csv", CBIO, vocab_cache_dir=tmp_path)
     assert list(res.routing["source_column"]) == ["Diagnosis"]
     reasons = dict(zip(res.skipped["source_column"], res.skipped["reason"]))
     assert reasons["patientId"].startswith("identifier-like")
     assert reasons["MUTATION_COUNT"].startswith("numeric")
 
     FakeOM.calls = []
-    res = harmonize("x.csv", schema="cbio", max_unique_ratio=None, max_numeric_frac=1.0)
+    res = harmonize("x.csv", CBIO, vocab_cache_dir=tmp_path,
+                    max_unique_ratio=None, max_numeric_frac=1.0)
     assert list(res.routing["source_column"]) == ["patientId", "MUTATION_COUNT", "Diagnosis"]
 
 
 def test_keep_noise_values_when_disabled(patched):
-    harmonize("x.csv", schema="cbio", drop_noise_values=False)
-    disease_vals = next(q for c, q, _ in FakeOM.calls if c == "disease")
+    patched["run"](drop_noise_values=False)
+    disease_vals = next(q for c, q, _ in FakeOM.calls if c == DISEASE)
     assert "Unknown" in disease_vals
 
 
-def test_custom_field_categories_and_threshold(patched):
-    res = harmonize("x.csv", schema="cbio", min_schema_score=0.0,
-                    field_categories={"treatment_name": ("treatment", "ncit")})
+def test_threshold(patched):
+    res = patched["run"](schema(treatment_name="NCIT:C1909"), min_schema_score=0.0)
     assert list(res.routing["source_column"]) == ["Drug"]
     assert FakeOM.calls[0][1] == ["cisplatin", "x", "y"]
 
 
 def test_onto_kwargs_forwarded(patched):
-    harmonize("x.csv", schema="cbio", onto_kwargs={"top_k": 3, "s3_strategy": "rag"})
+    patched["run"](onto_kwargs={"top_k": 3, "s3_strategy": "rag"})
     assert all(kw["top_k"] == 3 and kw["s3_strategy"] == "rag" for _, _, kw in FakeOM.calls)
 
 
+@pytest.mark.parametrize("key", ["corpus_df", "ontology_source"])
+def test_onto_kwargs_cannot_override_the_schema_corpus(patched, key):
+    with pytest.raises(ValueError, match="come from schema_table"):
+        patched["run"](onto_kwargs={key: "x"})
+
+
 def test_om_failure_is_isolated(patched):
-    res = harmonize("x.csv", schema="cbio", onto_kwargs={"fail": True})
-    assert set(res.errors) == {("disease", "ncit"), ("bodysite", "ncit")}
-    assert "corpus unavailable" in res.errors[("disease", "ncit")]
+    res = patched["run"](onto_kwargs={"fail": True})
+    assert set(res.errors) == {(DISEASE, "ncit"), (BODYSITE, "ncit")}
+    assert "corpus unavailable" in res.errors[(DISEASE, "ncit")]
     assert res.combined.empty
     with pytest.raises(RuntimeError):
-        harmonize("x.csv", schema="cbio", onto_kwargs={"fail": True}, raise_on_error=True)
+        patched["run"](onto_kwargs={"fail": True}, raise_on_error=True)
 
 
-def test_no_preset_requires_field_categories(patched):
-    with pytest.raises(ValueError, match="field_categories"):
-        harmonize("x.csv", schema=None)
-    with pytest.raises(ValueError, match="custom target_schema_path"):
-        harmonize("x.csv", schema="cbio", schema_kwargs={"target_schema_path": "s.csv"})
+@pytest.mark.parametrize("table", [None, "cbio", "gdc"])
+def test_schema_table_is_required(patched, table):
+    with pytest.raises(ValueError, match="write_schema_table_draft"):
+        harmonize("x.csv", table)
 
 
-def test_presets_reference_real_fields_and_registry_pairs():
-    from metaharmonizer.engine.ontology_mapping_engine import _CORPUS_REGISTRY
-    from metaharmonizer.models.schema_mapper.config import resolve_schema_preset
-
-    for schema, fields in FIELD_CATEGORY_PRESETS.items():
-        schema_fields = set(
-            pd.read_csv(resolve_schema_preset(schema)["target_schema_path"])["field_name"])
-        for fld, spec in fields.items():
-            assert fld in schema_fields, f"{schema}: {fld} not in schema CSV"
-            assert spec in _CORPUS_REGISTRY, f"{schema}: {spec} not in registry"
+def test_sibling_dictionaries_go_to_schema_mapper(patched, tmp_path):
+    path = tmp_path / "my_schema.csv"
+    CBIO.to_csv(path, index=False)
+    (tmp_path / "my_schema.alias.csv").write_text("field_name,source\n")
+    patched["run"](str(path))
+    kw = patched["sm_kwargs"]
+    assert kw["alias_dict_path"] == str(tmp_path / "my_schema.alias.csv")
+    assert "value_dict_path" not in kw          # no sibling -> engine default
 
 
 def test_lazy_top_level_export():
@@ -180,25 +213,20 @@ def test_lazy_top_level_export():
 # Per-sample merge (HarmonizeResult.harmonized / .wide)
 # ---------------------------------------------------------------------------
 
-UBERON = {"stool": ("feces", "UBERON_0001988"), "oralcavity": ("mouth", "UBERON_0000165"),
-          "rectum": ("rectum", "UBERON_0001052"), "left_colon": ("left colon", "UBERON_0008971"),
-          "hpc": ("preculminate fissure", "UBERON_0035926")}
+UBERON = {"stool": ("feces", "UBERON:0001988"), "oralcavity": ("mouth", "UBERON:0000165"),
+          "rectum": ("rectum", "UBERON:0001052"), "left_colon": ("left colon", "UBERON:0008971"),
+          "hpc": ("preculminate fissure", "UBERON:0035926")}
 NCIT = {"T2D": ("Type 2 Diabetes Mellitus", "C26747"), "healthy": ("Healthy", "C115935"),
         "type 2 diabetes": ("Type 2 Diabetes Mellitus", "C26747"),
         "schizophrenia": ("Schizophrenia", "C3362")}
 
 
 class CorpusOM:
-    """OM double that maps via a fixed table and exposes a normalized corpus."""
-    calls = []
+    """OM double that maps via a fixed table."""
 
     def __init__(self, category, query_ls, **kwargs):
-        CorpusOM.calls.append(category)
-        self.table = UBERON if category == "bodysite" else NCIT
+        self.table = UBERON if kwargs["ontology_source"] == "uberon" else NCIT
         self.query_ls = list(query_ls)
-        terms = {lab: code for lab, code in self.table.values()}
-        self.other_params = {"corpus_df": pd.DataFrame(
-            {"official_label": list(terms), "clean_code": list(terms.values())})}
 
     def run(self):
         hit = [self.table.get(q, ("Unrelated Thing", "X")) for q in self.query_ls]
@@ -207,7 +235,7 @@ class CorpusOM:
 
 
 @pytest.fixture
-def merge_case(monkeypatch):
+def merge_case(monkeypatch, tmp_path):
     data = pd.DataFrame({
         "sample_id": ["s1", "s2", "s3", "s4", "s5"],
         "body_site": ["stool", "stool", "stool", None, "oralcavity"],
@@ -215,6 +243,9 @@ def merge_case(monkeypatch):
         "hitchip_probe_class": [None, "hpc", None, None, None],
         "disease": ["T2D", "healthy", "T2D", "unknown", "healthy"],
         "study_condition": ["type 2 diabetes", None, "schizophrenia", None, "healthy"],
+        "subject_age": ["30", " 41 ", None, "", "nan"],
+        "age_alt": ["99", None, "52", None, None],
+        "age_noise": ["x"] * 5,
     }, dtype=object)
     schema_map = pd.DataFrame([
         {"query": "sample_id", "stage": "stage1", "match1": "sample_id", "match1_score": 1.0},
@@ -223,14 +254,20 @@ def merge_case(monkeypatch):
         {"query": "hitchip_probe_class", "stage": "stage3", "match1": "body_site", "match1_score": 0.65},
         {"query": "disease", "stage": "stage1", "match1": "disease", "match1_score": 1.0},
         {"query": "study_condition", "stage": "stage3", "match1": "disease", "match1_score": 0.7},
+        {"query": "subject_age", "stage": "stage3", "match1": "age", "match1_score": 0.9},
+        {"query": "age_alt", "stage": "stage3", "match1": "age", "match1_score": 0.7},
+        {"query": "age_noise", "stage": "stage3", "match1": "age", "match1_score": 0.5},
     ])
     monkeypatch.setattr(pipeline, "_make_schema_engine",
                         lambda path, **kw: FakeSM(data, schema_map))
     monkeypatch.setattr(pipeline, "_make_onto_engine", CorpusOM)
-    cats = {"body_site": ("bodysite", "uberon"), "disease": ("disease", "ncit")}
-    return lambda **kw: harmonize("x.csv", schema=None, field_categories=cats,
+    terms = {"UBERON:0001062": list(UBERON.values()),
+             "NCIT:C7057": [(lab, "NCIT:" + c) for lab, c in NCIT.values()]}
+    monkeypatch.setattr(sv, "_fetch_terms", fake_fetch(terms))
+    table = schema(sample_id="", body_site="UBERON:0001062", disease="NCIT:C7057", age="")
+    return lambda **kw: harmonize("x.csv", table, vocab_cache_dir=tmp_path,
                                   min_schema_score=0.6, max_unique_ratio=None,
-                                  id_columns=["sample_id"], **kw)
+                                  **{"id_columns": ["sample_id"], **kw})
 
 
 def _h(res, field):
@@ -276,30 +313,66 @@ def test_same_term_from_dropped_column_is_not_a_conflict(merge_case):
 
 def test_wide_matches_release_layout(merge_case):
     w = merge_case(multi_valued_fields={"disease"}).wide()
-    assert list(w.columns) == ["row", "sample_id", "body_site", "body_site_ontology_term_id",
-                               "disease", "disease_ontology_term_id"]
+    assert list(w.columns) == [ROW_ID, "sample_id", "body_site", "body_site_ontology_term_id",
+                               "disease", "disease_ontology_term_id", "age"]
     assert len(w) == 5
     assert w.loc[2, "disease_ontology_term_id"] == "NCIT:C26747;NCIT:C3362"
     assert pd.isna(w.loc[3, "disease"])
 
 
+def test_wide_passes_through_unmapped_fields(merge_case):
+    res = merge_case()
+    assert set(res.passthrough_routing["source_column"]) == {"subject_age", "age_alt"}  # 0.5 < 0.6
+    w = res.wide().set_index("sample_id")
+    # best-scoring column per row, falling back to the next one; blanks are NaN
+    assert w.loc["s1", "age"] == "30" and w.loc["s2", "age"] == "41"
+    assert w.loc["s3", "age"] == "52"
+    assert pd.isna(w.loc["s4", "age"]) and pd.isna(w.loc["s5", "age"])
+    assert "age" not in res.wide(passthrough=False).columns
+
+
+def test_wide_provenance_columns(merge_case):
+    w = merge_case().wide(provenance=True).set_index("sample_id")
+    assert w.loc["s1", "body_site_source_column"] == "body_site"
+    assert w.loc["s1", "body_site_original_value"] == "stool"
+    assert w.loc["s1", "body_site_schema_score"] == 1.0
+    assert w.loc["s1", "body_site_map_score"] == 0.9
+    assert w.loc["s1", "body_site_dropped"] == "disease_location=rectum→rectum"
+    assert w.loc["s4", "body_site_source_column"] == "disease_location"
+    assert w.loc["s4", "body_site_schema_score"] == 0.75
+    assert pd.isna(w.loc["s4", "body_site_dropped"])
+    assert w.loc["s3", "age_source_column"] == "age_alt"
+    assert w.loc["s3", "age_schema_score"] == 0.7
+    assert "age_map_score" not in w.columns            # passthrough: no ontology mapping
+
+
 def test_id_columns_validated(merge_case):
-    with pytest.raises(ValueError, match="id_columns"):
-        harmonize(
-            "x.csv", schema=None, field_categories={"body_site": ("bodysite", "uberon")},
-            id_columns=["nope"])
+    with pytest.raises(ValueError, match="id_columns not in input"):
+        merge_case(id_columns=["nope"])
 
 
-def test_to_curie():
-    from metaharmonizer.pipeline import _to_curie
-    assert _to_curie("C1909", "ncit") == "NCIT:C1909"
-    assert _to_curie("UBERON_0001988", "uberon") == "UBERON:0001988"
-    assert _to_curie("NCIT:C1909", "ncit") == "NCIT:C1909"
-    assert _to_curie("local42", "uberon") == "local42"
-    assert _to_curie("nan", "ncit") == ""
+@pytest.mark.parametrize("col", [ROW_ID, "value", "term_id", "disease"])
+def test_id_columns_must_not_clash_with_generated_columns(merge_case, col):
+    with pytest.raises(ValueError, match="clash"):
+        merge_case(id_columns=[col])
 
 
-def test_harmonized_has_no_term_ids_when_engine_exposes_no_corpus(patched):
-    res = harmonize("x.csv", schema="cbio")
-    assert set(res.harmonized["curated_field"]) == {"disease", "cancer_type", "body_site"}
-    assert res.harmonized["term_id"].eq("").all()   # FakeOM exposes no corpus
+def test_input_column_named_row_is_carried_as_an_id(merge_case, monkeypatch):
+    real = pipeline._make_schema_engine
+
+    def with_row(path, **kw):
+        sm = real(path, **kw)
+        sm.df = sm.df.assign(row=[f"r{i}" for i in range(len(sm.df))])
+        return sm
+
+    monkeypatch.setattr(pipeline, "_make_schema_engine", with_row)
+    res = merge_case(id_columns=["row"])
+    assert list(res.harmonized.columns[:2]) == [ROW_ID, "row"]
+    assert list(res.wide()["row"]) == ["r0", "r1", "r2", "r3", "r4"]
+
+
+def test_term_ids_are_the_corpus_curies(merge_case):
+    h = merge_case().harmonized
+    assert set(h["term_id"]) <= {"UBERON:0001988", "UBERON:0000165", "UBERON:0001052",
+                                 "NCIT:C26747", "NCIT:C115935", "NCIT:C3362"}
+    assert set(h["ontology_source"]) == {"uberon", "ncit"}

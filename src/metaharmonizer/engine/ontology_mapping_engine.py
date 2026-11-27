@@ -118,12 +118,15 @@ class OntoMapEngine:
                 ``corpus_df`` when omitted.
             corpus_df (pd.DataFrame, optional): Full custom corpus. Must contain a
                 label column (``official_label`` or ``label``) and a code column
-                (``clean_code`` or ``obo_id``). When provided, ``ontology_source`` is
-                auto-inferred from the code prefixes. Auto-loaded from the cached CSV or
-                built from the API when omitted.
+                (``clean_code`` or ``obo_id``). When provided, its ontology is read
+                from the code prefixes. Auto-loaded from the cached CSV or built
+                from the API when omitted.
             ontology_source (str, optional): Ontology backend; defaults to ``"ncit"``.
                 Supported: ``ncit`` (NCI EVSREST), ``mondo``, ``uberon`` (EBI OLS4),
-                per ``_CORPUS_REGISTRY``. Ignored/overridden when ``corpus_df`` is given.
+                per ``_CORPUS_REGISTRY``. With ``corpus_df``, omit it (the corpus's
+                code prefixes decide) or pass the same ontology; a different one
+                raises ``ValueError``. A corpus whose prefixes no ontology client
+                knows is a local corpus and keeps the source as given.
             query_df (pd.DataFrame, optional): DataFrame query mode (alternative to the
                 ``query`` list); requires ``query_col``.
             query_col (str, optional): Column in ``query_df`` holding the query terms.
@@ -342,17 +345,21 @@ class OntoMapEngine:
                 )
             inferred = detected[0] if detected else self._ontology_source
             if inferred != self._ontology_source:
-                import warnings
-                warnings.warn(
-                    f"ontology_source overridden: '{self._ontology_source}' → "
-                    f"'{inferred}' (inferred from corpus_df code prefixes)",
-                    UserWarning,
-                    stacklevel=2,
-                )
-                self._logger.warning(
-                    f"Overriding ontology_source: "
-                    f"'{self._ontology_source}' → '{inferred}' "
-                    f"(inferred from corpus_df code prefixes)"
+                # The corpus's code prefixes say which ontology it is. A caller
+                # who named a different one has a corpus/source mix-up; fail
+                # rather than pick a winner, since term IDs and concept tables
+                # would silently follow whichever side won.
+                if ("ontology_source" in self.other_params
+                        and not self._same_source(self._ontology_source, inferred)):
+                    raise ValueError(
+                        f"ontology_source='{self._ontology_source}' contradicts "
+                        f"corpus_df, whose codes are {inferred} "
+                        f"(e.g. {groups[inferred][:3]}). Pass "
+                        f"ontology_source='{inferred}', or omit it to use the "
+                        f"corpus's own ontology."
+                    )
+                self._logger.info(
+                    f"ontology_source '{inferred}' read from corpus_df code prefixes"
                 )
                 self._ontology_source = validate_identifier(
                     inferred, "ontology_source")
@@ -661,6 +668,19 @@ class OntoMapEngine:
     # ------------------------------------------------------------------
     # Concept table building (RAG + synonym)
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _same_source(named: str, inferred: str) -> bool:
+        """Whether a caller-named ``ontology_source`` agrees with the one read
+        from corpus codes. Accepts the code prefix itself as a name for its
+        ontology (``orphanet`` for ``ordo``), case-insensitively."""
+        from metaharmonizer.knowledge_db.db_clients.ols_db import PREFIX_TO_ONTOLOGY
+
+        named, inferred = named.lower(), inferred.lower()
+        if named == inferred:
+            return True
+        by_prefix = {p.lower(): o for p, o in PREFIX_TO_ONTOLOGY.items()}
+        return by_prefix.get(named) == inferred
 
     @staticmethod
     def _partition_codes(codes: list[str]) -> dict[str, list[str]]:
